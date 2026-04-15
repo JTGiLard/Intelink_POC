@@ -93,19 +93,24 @@ _nlp = None
 def _get_nlp():
     global _nlp
     if _nlp is None:
-        import spacy
+        try:
+            import spacy
+        except Exception:
+            _nlp = False
+            return None
 
         try:
             _nlp = spacy.load("en_core_web_sm")
-        except OSError as e:
-            raise RuntimeError(
-                "spaCy model 'en_core_web_sm' is required. Run: python -m spacy download en_core_web_sm"
-            ) from e
-    return _nlp
+        except OSError:
+            _nlp = False
+            return None
+    return _nlp if _nlp is not False else None
 
 
 def extract_persons_spacy(text: str) -> list[EntityHit]:
     nlp = _get_nlp()
+    if nlp is None:
+        return []
     doc = nlp(text[:100000])
     hits: list[EntityHit] = []
     for ent in doc.ents:

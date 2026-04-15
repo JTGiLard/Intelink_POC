@@ -19,10 +19,27 @@ _ISO_LIKE = re.compile(
 
 @dataclass
 class TimelineEvent:
-    when: datetime
+    when: datetime | str | None
     label: str
     detail: str
     chunk_id: str
+
+
+def timeline_sort_key(value: datetime | str | None) -> str:
+    if isinstance(value, datetime):
+        return value.isoformat(timespec="seconds")
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if not text:
+        return ""
+    normalized = text.replace("T", " ")
+    for fmt, size in (("%Y-%m-%d %H:%M:%S", 19), ("%Y-%m-%d %H:%M", 16)):
+        try:
+            return datetime.strptime(normalized[:size], fmt).isoformat(timespec="seconds")
+        except ValueError:
+            continue
+    return text.lower()
 
 
 def _parse_ws_line_ts(date_part: str, time_part: str) -> datetime | None:
@@ -81,11 +98,11 @@ def extract_timeline_events(record: ChunkRecord, max_events: int = 8) -> list[Ti
             )
         )
 
-    events.sort(key=lambda e: e.when)
+    events.sort(key=lambda e: timeline_sort_key(e.when))
     dedup: list[TimelineEvent] = []
     seen: set[tuple[str, str]] = set()
     for e in events:
-        key = (e.when.isoformat(timespec="minutes"), e.detail[:80])
+        key = (timeline_sort_key(e.when), e.detail[:80])
         if key in seen:
             continue
         seen.add(key)

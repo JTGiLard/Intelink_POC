@@ -24,8 +24,8 @@ from intelligence.index_store import (
     save_cache,
     try_load_cache,
 )
-from intelligence.loaders import default_data_root, iter_documents
-from intelligence.timeline import TimelineEvent, extract_timeline_events
+from intelligence.loaders import iter_documents
+from intelligence.timeline import TimelineEvent, extract_timeline_events, timeline_sort_key
 
 
 load_dotenv()
@@ -47,7 +47,9 @@ def get_spacy_ready() -> str:
     from intelligence.entities import extract_persons_spacy
 
     extract_persons_spacy("John Tan met Mary.")
-    return "ok"
+    if extract_persons_spacy("John Tan met Mary."):
+        return "ok"
+    return "fallback"
 
 
 def build_or_load_index(data_root: Path, use_cache: bool) -> FaissIndexStore:
@@ -114,7 +116,7 @@ def aggregate_dashboard(
         timeline.extend(extract_timeline_events(r))
     summary = summarize_entities(all_hits)
     edges = cooccurrence_edges(texts_entities, min_weight=1)
-    timeline.sort(key=lambda e: e.when)
+    timeline.sort(key=lambda e: timeline_sort_key(e.when))
     return summary, edges[:80], timeline
 
 
@@ -130,7 +132,8 @@ def main() -> None:
     st.title("AI-powered intelligence search")
     st.caption("Semantic search with FAISS, OpenAI embeddings, and entity-aware analytics.")
 
-    data_root = Path(st.sidebar.text_input("Data folder", value=str(default_data_root())))
+    default_data_path = Path(__file__).resolve().parent / "data"
+    data_root = Path(st.sidebar.text_input("Data folder", value=str(default_data_path)))
     use_cache = st.sidebar.toggle("Use disk cache for index", value=True)
     top_k = st.sidebar.slider("Results (FAISS top-K)", min_value=5, max_value=50, value=15)
     keyword_boost = st.sidebar.slider("Keyword boost for hybrid ranking", 0.0, 0.25, 0.12)
@@ -144,10 +147,14 @@ def main() -> None:
 
         subprocess.run(["python", "-m", "spacy", "download", "en_core_web_sm"], check=False)
 
+    spacy_status = "fallback"
     try:
-        get_spacy_ready()
+        spacy_status = get_spacy_ready()
     except Exception as e:
         st.warning(str(e))
+        spacy_status = "fallback"
+    if spacy_status != "ok":
+        st.sidebar.info("spaCy model not found; using regex-only entity extraction")
 
     if not data_root.is_dir():
         st.warning(f"Data folder does not exist yet: `{data_root}`. Creating sample tree is recommended.")
@@ -245,7 +252,13 @@ def main() -> None:
             st.write("No dated events parsed from this result set.")
         else:
             rows = [
-                {"time": e.when, "label": e.label, "detail": e.detail, "chunk": e.chunk_id} for e in timeline
+                {
+                    "time": timeline_sort_key(e.when),
+                    "label": e.label,
+                    "detail": e.detail,
+                    "chunk": e.chunk_id,
+                }
+                for e in timeline
             ]
             df_t = pd.DataFrame(rows)
             fig = px.scatter(
