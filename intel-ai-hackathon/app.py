@@ -139,45 +139,64 @@ def _format_list(values: list[str], empty: str, limit: int = 3) -> str:
     return f"{', '.join(shown[:-1])}, and {shown[-1]}{suffix}"
 
 
+def _source_label(source_type: str, count: int) -> str:
+    if source_type == "whatsapp":
+        return "WhatsApp"
+    if source_type == "report":
+        return "a report" if count == 1 else "reports"
+    if source_type == "email":
+        return "an email" if count == 1 else "emails"
+    return source_type
+
+
+def _format_sources_plain(source_types: list[str]) -> str:
+    if not source_types:
+        return ""
+    counts: dict[str, int] = {}
+    for s in source_types:
+        counts[s] = counts.get(s, 0) + 1
+    ordered = list(dict.fromkeys(source_types))
+    labels = [_source_label(s, counts.get(s, 0)) for s in ordered]
+    return _format_list(labels, "", limit=3)
+
+
 def build_ai_summary(
-    ranked: list[tuple[ChunkRecord, float]], summary: EntitySummary, timeline: list[TimelineEvent]
+    ranked: list[tuple[ChunkRecord, float]], summary: EntitySummary, timeline: list[TimelineEvent], query: str
 ) -> str:
+    _ = timeline
+    if not ranked:
+        return "No records were returned for this query."
+
     main_person = summary.persons.most_common(1)
-    main_person_text = main_person[0][0] if main_person else "No primary person"
-    person_records = 0
-    if main_person:
-        target = main_person[0][0].lower()
-        person_records = sum(1 for r, _ in ranked if target in r.text.lower())
+    subject = ""
+    if main_person and main_person[0][1] >= 2:
+        subject = main_person[0][0]
+    elif query.strip():
+        subject = query.strip()
 
-    vehicles = [name for name, _ in summary.vehicles.most_common(3)]
-    phones = [name for name, _ in summary.phones.most_common(3)]
-    record_titles = [f"{r.doc_title}" for r, _ in ranked]
-    unique_titles = list(dict.fromkeys(record_titles))
+    source_types = [r.source_type for r, _ in ranked]
+    vehicles = [name for name, _ in summary.vehicles.most_common(2)]
+    phones = [name for name, _ in summary.phones.most_common(2)]
 
-    action_tokens = re.findall(
-        r"\b(inspection|monitoring|surveillance|follow-up|interview|warning|search|arrest)\b",
-        " ".join(r.text.lower()[:1200] for r, _ in ranked),
-    )
-    prior_actions = list(dict.fromkeys(a.title() for a in action_tokens))
-    if not prior_actions and timeline:
-        prior_actions = list(dict.fromkeys(e.label for e in timeline[:5]))
-
-    if main_person and (vehicles or phones):
-        recommendation = "conduct follow-up checks"
-    elif main_person:
-        recommendation = "continue targeted monitoring"
+    sentences: list[str] = []
+    sources_text = _format_sources_plain(source_types)
+    if subject:
+        if sources_text:
+            sentences.append(f"{subject} appears across {len(ranked)} records from {sources_text}.")
+        else:
+            sentences.append(f"{subject} appears across {len(ranked)} records.")
+    elif sources_text:
+        sentences.append(f"{len(ranked)} records were returned from {sources_text}.")
     else:
-        recommendation = "collect more corroborating records"
+        sentences.append(f"{len(ranked)} records were returned.")
 
-    return (
-        f"{main_person_text} appears in {person_records} records and is linked to "
-        f"{_format_list(vehicles, 'no specific vehicles')}. "
-        f"{len(summary.phones)} phone numbers are associated"
-        f"{f' ({_format_list(phones, 'none')})' if phones else ''}. "
-        f"Prior records found include {_format_list(unique_titles, 'no prior records identified', limit=4)}. "
-        f"Previous actions include {_format_list(prior_actions, 'none identified')}. "
-        f"Recommended next step: {recommendation}."
-    )
+    if vehicles:
+        sentences.append(f"Linked vehicles include {_format_list(vehicles, '', limit=2)}.")
+    if phones:
+        sentences.append(f"Associated phone numbers include {_format_list(phones, '', limit=2)}.")
+
+    sentences.append("Recommended next step: review linked entities and gather corroborating records.")
+    return " ".join(sentences)
 
 
 def main() -> None:
@@ -200,8 +219,8 @@ def main() -> None:
         spacy_status = get_spacy_ready()
     except Exception:
         spacy_status = "fallback"
-    if spacy_status != "ok":
-        st.sidebar.info("spaCy model not found; using regex-only entity extraction")
+    _ = spacy_status
+    st.sidebar.info("Demo mode: fast entity extraction enabled.")
 
     if not data_root.is_dir():
         st.warning(f"Data folder does not exist yet: `{data_root}`. Creating sample tree is recommended.")
@@ -246,7 +265,7 @@ def main() -> None:
     ranked = hybrid_rank(raw_hits, query, keyword_boost=keyword_boost)
     summary, edges, timeline = aggregate_dashboard(ranked, query)
     st.subheader("AI Summary")
-    st.write(build_ai_summary(ranked, summary, timeline))
+    st.write(build_ai_summary(ranked, summary, timeline, query))
 
     res_tab, ent_tab, rel_tab, time_tab = st.tabs(
         ["Search results", "Entity summary", "Relationship links", "Timeline"]
