@@ -46,8 +46,8 @@ def get_spacy_ready() -> str:
     """Warm-up spaCy once per process."""
     from intelligence.entities import extract_persons_spacy
 
-    extract_persons_spacy("John Tan met Mary.")
-    if extract_persons_spacy("John Tan met Mary."):
+    person_hits = extract_persons_spacy("John Tan met Mary.")
+    if person_hits:
         return "ok"
     return "fallback"
 
@@ -127,6 +127,59 @@ def highlight_query(text: str, query: str) -> str:
     return re.sub(f"({esc})", r"**\1**", text, flags=re.IGNORECASE)
 
 
+def _format_list(values: list[str], empty: str, limit: int = 3) -> str:
+    if not values:
+        return empty
+    shown = values[:limit]
+    suffix = " and others" if len(values) > limit else ""
+    if len(shown) == 1:
+        return f"{shown[0]}{suffix}"
+    if len(shown) == 2:
+        return f"{shown[0]} and {shown[1]}{suffix}"
+    return f"{', '.join(shown[:-1])}, and {shown[-1]}{suffix}"
+
+
+def build_ai_summary(
+    ranked: list[tuple[ChunkRecord, float]], summary: EntitySummary, timeline: list[TimelineEvent]
+) -> str:
+    main_person = summary.persons.most_common(1)
+    main_person_text = main_person[0][0] if main_person else "No primary person"
+    person_records = 0
+    if main_person:
+        target = main_person[0][0].lower()
+        person_records = sum(1 for r, _ in ranked if target in r.text.lower())
+
+    vehicles = [name for name, _ in summary.vehicles.most_common(3)]
+    phones = [name for name, _ in summary.phones.most_common(3)]
+    record_titles = [f"{r.doc_title}" for r, _ in ranked]
+    unique_titles = list(dict.fromkeys(record_titles))
+
+    action_tokens = re.findall(
+        r"\b(inspection|monitoring|surveillance|follow-up|interview|warning|search|arrest)\b",
+        " ".join(r.text.lower()[:1200] for r, _ in ranked),
+    )
+    prior_actions = list(dict.fromkeys(a.title() for a in action_tokens))
+    if not prior_actions and timeline:
+        prior_actions = list(dict.fromkeys(e.label for e in timeline[:5]))
+
+    if main_person and (vehicles or phones):
+        recommendation = "conduct follow-up checks"
+    elif main_person:
+        recommendation = "continue targeted monitoring"
+    else:
+        recommendation = "collect more corroborating records"
+
+    return (
+        f"{main_person_text} appears in {person_records} records and is linked to "
+        f"{_format_list(vehicles, 'no specific vehicles')}. "
+        f"{len(summary.phones)} phone numbers are associated"
+        f"{f' ({_format_list(phones, 'none')})' if phones else ''}. "
+        f"Prior records found include {_format_list(unique_titles, 'no prior records identified', limit=4)}. "
+        f"Previous actions include {_format_list(prior_actions, 'none identified')}. "
+        f"Recommended next step: {recommendation}."
+    )
+
+
 def main() -> None:
     st.set_page_config(page_title="Intel Search", layout="wide", initial_sidebar_state="expanded")
     st.title("AI-powered intelligence search")
@@ -142,16 +195,10 @@ def main() -> None:
         st.error("Set `OPENAI_API_KEY` in a `.env` file or your environment.")
         st.stop()
 
-    if st.sidebar.button("Install spaCy model (one-time)"):
-        import subprocess
-
-        subprocess.run(["python", "-m", "spacy", "download", "en_core_web_sm"], check=False)
-
     spacy_status = "fallback"
     try:
         spacy_status = get_spacy_ready()
-    except Exception as e:
-        st.warning(str(e))
+    except Exception:
         spacy_status = "fallback"
     if spacy_status != "ok":
         st.sidebar.info("spaCy model not found; using regex-only entity extraction")
@@ -198,6 +245,8 @@ def main() -> None:
     raw_hits = store.search(qv[0], k=top_k)
     ranked = hybrid_rank(raw_hits, query, keyword_boost=keyword_boost)
     summary, edges, timeline = aggregate_dashboard(ranked, query)
+    st.subheader("AI Summary")
+    st.write(build_ai_summary(ranked, summary, timeline))
 
     res_tab, ent_tab, rel_tab, time_tab = st.tabs(
         ["Search results", "Entity summary", "Relationship links", "Timeline"]
