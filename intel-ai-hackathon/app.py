@@ -33,6 +33,15 @@ from intelligence.timeline import TimelineEvent, extract_timeline_events, timeli
 load_dotenv()
 
 
+def _person_phrase_from_query(query: str) -> str:
+    """First segment before ``+`` or ``,`` — used for person-style matching (case-insensitive)."""
+    raw = query.strip()
+    if not raw:
+        return ""
+    parts = [p.strip() for p in re.split(r"[+,]", raw) if p.strip()]
+    return parts[0] if parts else raw
+
+
 def _cache_base() -> Path:
     return Path(__file__).resolve().parent / ".cache_index"
 
@@ -112,23 +121,28 @@ def hybrid_rank(
     query: str,
     keyword_boost: float = 0.12,
 ) -> list[tuple[ChunkRecord, float]]:
-    q = query.strip().lower()
-    if not q:
+    q_full = query.strip().lower()
+    pq = _person_phrase_from_query(query).strip().lower()
+    if not q_full and not pq:
         return hits
-    tokens = [t for t in q.split() if len(t) > 1]
-    person_style = len(tokens) >= 2
+    extra_terms = [p.strip().lower() for p in re.split(r"[+,]", query.strip())[1:] if p.strip()]
+    person_tokens = [t for t in pq.split() if len(t) > 1] if pq else []
+    person_style = len(person_tokens) >= 2
     rescored: list[tuple[ChunkRecord, float]] = []
     for r, s in hits:
         text_l = r.text.lower()
-        bonus = keyword_boost if q in text_l else 0.0
-        if len(q) > 3:
-            parts = [p for p in q.split() if len(p) > 2]
+        bonus = keyword_boost if q_full in text_l else 0.0
+        for kw in extra_terms:
+            if kw and kw in text_l:
+                bonus += keyword_boost * 0.92
+        if len(q_full) > 3:
+            parts = [p for p in q_full.split() if len(p) > 2]
             if parts and all(p in text_l for p in parts):
                 bonus = max(bonus, keyword_boost * 0.85)
-        if person_style:
-            bonus += _person_name_rank_adjust(r.text, q)
-        elif len(tokens) == 1:
-            t0 = tokens[0]
+        if person_style and pq:
+            bonus += _person_name_rank_adjust(r.text, pq)
+        elif len(person_tokens) == 1 and pq:
+            t0 = person_tokens[0]
             if re.search(rf"(?i)\b{re.escape(t0)}\b", text_l):
                 bonus += 0.035
         rescored.append((r, s + bonus))
@@ -137,8 +151,8 @@ def hybrid_rank(
 
 
 def has_exact_full_name_hit(ranked: list[tuple[ChunkRecord, float]], query: str) -> bool:
-    q = query.strip().lower()
-    tokens = [t for t in q.split() if len(t) > 1]
+    pq = _person_phrase_from_query(query).strip().lower()
+    tokens = [t for t in pq.split() if len(t) > 1]
     if len(tokens) < 2:
         return True
     phrase = " ".join(tokens)
@@ -393,6 +407,8 @@ def main() -> None:
                 st.plotly_chart(gfig, use_container_width=True)
                 if gnote:
                     st.caption(gnote)
+            else:
+                st.warning("Graph failed to render but edges exist")
             df_e = pd.DataFrame(
                 edges,
                 columns=["Entity A", "Entity B", "Strength", "Strength label", "Link type"],

@@ -1,8 +1,9 @@
-"""Small Plotly network graph for link analysis (retrieved chunks only)."""
+"""Plotly relationship graph for link analysis (current retrieval only)."""
 
 from __future__ import annotations
 
 import math
+import re
 from collections import defaultdict
 from typing import Any
 
@@ -13,12 +14,12 @@ from intelligence.entities import extract_all_entities
 from intelligence.index_store import ChunkRecord
 
 
-# Readable graph size: co-occurrence entities (cap), then case/source hubs up to MAX_TOTAL_NODES.
-MAX_ENTITY_NODES = 14
+GRAPH_TOP_EDGES = 12
 MAX_TOTAL_NODES = 16
 MAX_CASE_NODES = 4
 
 SIMPLIFIED_CAPTION = "Showing simplified relationship graph for readability."
+GRAPH_FAIL_MSG = "Graph could not be rendered from current extracted entities."
 
 
 def _case_node(doc_id: str) -> str:
@@ -40,7 +41,7 @@ def _node_kind(node_id: str) -> str:
     if ":" not in node_id:
         return "other"
     prefix = node_id.split(":", 1)[0].lower()
-    if prefix in ("person", "vehicle", "phone", "case", "source"):
+    if prefix in ("person", "vehicle", "phone", "case", "source", "pseudo"):
         return prefix
     return "other"
 
@@ -48,17 +49,22 @@ def _node_kind(node_id: str) -> str:
 def _short_label(node_id: str) -> str:
     kind, _, rest = node_id.partition(":")
     if kind == "case":
-        return rest[:18] + ("…" if len(rest) > 18 else "")
+        return rest[:12] + ("…" if len(rest) > 12 else "")
     if kind == "source":
-        return rest[:20]
-    if len(rest) > 22:
-        return rest[:20] + "…"
+        return rest[:12]
+    if kind == "pseudo":
+        t = rest.strip()
+        disp = " ".join(w[:1].upper() + w[1:].lower() if w else w for w in t.split())
+        return (disp[:14] + "…") if len(disp) > 14 else disp
+    if len(rest) > 14:
+        return rest[:12] + "…"
     return rest
 
 
 def _marker_symbol(kind: str) -> str:
     return {
         "person": "circle",
+        "pseudo": "circle",
         "vehicle": "square",
         "phone": "diamond",
         "case": "star",
@@ -70,12 +76,155 @@ def _marker_symbol(kind: str) -> str:
 def _marker_color(kind: str) -> str:
     return {
         "person": "#2563eb",
+        "pseudo": "#1d4ed8",
         "vehicle": "#059669",
         "phone": "#d97706",
         "case": "#64748b",
         "source": "#7c3aed",
         "other": "#94a3b8",
     }.get(kind, "#94a3b8")
+
+
+def _first_query_segment(query: str) -> str:
+    raw = query.strip()
+    if not raw:
+        return ""
+    parts = [p.strip() for p in re.split(r"[+,]", raw) if p.strip()]
+    return parts[0] if parts else raw
+
+
+def _looks_like_person_name(s: str) -> bool:
+    s = s.strip()
+    if len(s) < 3:
+        return False
+    return bool(re.match(r"^[A-Za-z][A-Za-z\s.'-]*[A-Za-z]$", s)) and len(s.split()) >= 2
+
+
+def _dedupe_edges_keep_max_strength(
+    edges: list[tuple[str, str, float, str, str]],
+) -> list[tuple[str, str, float, str, str]]:
+    best: dict[tuple[str, str], tuple[str, str, float, str, str]] = {}
+    for e in edges:
+        a, b, s, _lbl, _lt = e
+        k = (a, b) if a < b else (b, a)
+        if k not in best or s > best[k][2]:
+            best[k] = e
+    return list(best.values())
+
+
+def _largest_connected_subgraph(
+    edges: list[tuple[str, str, float, str, str]],
+) -> list[tuple[str, str, float, str, str]]:
+    if not edges:
+        return []
+    parent: dict[str, str] = {}
+
+    def find(x: str) -> str:
+        if x not in parent:
+            parent[x] = x
+        if parent[x] != x:
+            parent[x] = find(parent[x])
+        return parent[x]
+
+    def union(a: str, b: str) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    for a, b, *_ in edges:
+        union(a, b)
+    groups: dict[str, list[tuple[str, str, float, str, str]]] = defaultdict(list)
+    for e in edges:
+        groups[find(e[0])].append(e)
+    best: list[tuple[str, str, float, str, str]] = []
+    best_score = -1.0
+    for comp in groups.values():
+        sc = sum(c[2] for c in comp)
+        if sc > best_score or (sc == best_score and len(comp) > len(best)):
+            best_score = sc
+            best = comp
+    return best
+
+
+def _entity_nodes_from_edges(edges: list[tuple[str, str, float, str, str]]) -> set[str]:
+    out: set[str] = set()
+    for a, b, *_ in edges:
+        out.add(a)
+        out.add(b)
+    return out
+
+
+def _degree_in_edges(node: str, edges: list[tuple[str, str, float, str, str]]) -> int:
+    return sum(1 for a, b, *_ in edges if a == node or b == node)
+
+
+def _find_person_node_case_insensitive(entity_nodes: set[str], person_candidate: str) -> str | None:
+    pl = person_candidate.strip().lower()
+    if not pl:
+        return None
+    for n in entity_nodes:
+        if not n.lower().startswith("person:"):
+            continue
+        rest = n.split(":", 1)[1].strip().lower()
+        if rest == pl:
+            return n
+    return None
+
+
+def _pick_anchor_node(
+    entity_nodes: set[str],
+    reduced_edges: list[tuple[str, str, float, str, str]],
+    pseudo_id: str | None,
+) -> str | None:
+    if pseudo_id and pseudo_id in entity_nodes:
+        return pseudo_id
+    persons = [n for n in entity_nodes if _node_kind(n) == "person"]
+    if persons:
+        return max(persons, key=lambda n: _degree_in_edges(n, reduced_edges))
+    if not reduced_edges:
+        return next(iter(entity_nodes), None)
+    top = max(reduced_edges, key=lambda e: e[2])
+    a, b = top[0], top[1]
+    da, db = _degree_in_edges(a, reduced_edges), _degree_in_edges(b, reduced_edges)
+    return a if da >= db else b
+
+
+def _recenter_positions(
+    pos: dict[str, tuple[float, float]],
+    anchor_id: str | None,
+    anchor_b: str | None = None,
+) -> dict[str, tuple[float, float]]:
+    if anchor_id is None or anchor_id not in pos:
+        return pos
+    if anchor_b and anchor_b in pos:
+        ox = (pos[anchor_id][0] + pos[anchor_b][0]) / 2.0
+        oy = (pos[anchor_id][1] + pos[anchor_b][1]) / 2.0
+    else:
+        ox, oy = pos[anchor_id]
+    return {nid: (float(x - ox), float(y - oy)) for nid, (x, y) in pos.items()}
+
+
+def _sanitize_and_scale_positions(
+    pos: dict[str, tuple[float, float]],
+) -> dict[str, tuple[float, float]]:
+    if not pos:
+        return {}
+    out: dict[str, tuple[float, float]] = {}
+    xs: list[float] = []
+    ys: list[float] = []
+    for nid, (x, y) in pos.items():
+        xf = float(np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0))
+        yf = float(np.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0))
+        out[nid] = (xf, yf)
+        xs.append(xf)
+        ys.append(yf)
+    if not xs:
+        return out
+    mx = max(abs(v) for v in xs) or 1e-6
+    my = max(abs(v) for v in ys) or 1e-6
+    m = max(mx, my, 1e-6)
+    scaled = {k: (v[0] / m, v[1] / m) for k, v in out.items()}
+    return scaled
 
 
 def _fr_layout(
@@ -100,7 +249,6 @@ def _fr_layout(
             for j in range(i + 1, n):
                 delta = pos[i] - pos[j]
                 dist2 = float(np.dot(delta, delta)) + 1e-6
-                dist = math.sqrt(dist2)
                 force = (k * k / dist2) * delta
                 disp[i] += force
                 disp[j] -= force
@@ -118,6 +266,7 @@ def _fr_layout(
     pos -= pos.mean(axis=0)
     mx = float(np.max(np.abs(pos)) + 1e-9)
     pos /= mx
+    pos = np.nan_to_num(pos, nan=0.0, posinf=0.0, neginf=0.0)
     return {node_list[i]: (float(pos[i, 0]), float(pos[i, 1])) for i in range(n)}
 
 
@@ -129,295 +278,125 @@ def _merge_edge_weights(pairs: list[tuple[str, str, float]]) -> list[tuple[str, 
     return [(a, b, w) for (a, b), w in merged.items()]
 
 
-def _entity_nodes_from_edges(edges: list[tuple[str, str, float, str, str]]) -> set[str]:
-    out: set[str] = set()
-    for a, b, *_ in edges:
-        out.add(a)
-        out.add(b)
-    return out
-
-
-def _resolve_query_entity_node(entity_nodes: set[str], query: str) -> str | None:
-    q = query.strip()
-    if not q:
-        return None
-    ql = q.lower()
-    for n in entity_nodes:
-        if _node_kind(n) not in ("person", "vehicle", "phone"):
-            continue
-        rest = n.split(":", 1)[1].strip()
-        if rest.lower() == ql:
-            return n
-    return None
-
-
-def _grow_coocc_subgraph(
-    edges_ordered: list[tuple[str, str, float, str, str]],
-    seed_nodes: set[str],
-    entity_cap: int,
-) -> tuple[set[str], list[tuple[str, str, float, str, str]]]:
-    """Greedy add co-occurrence edges that touch the growing set until entity node cap."""
-    nodes = set(seed_nodes)
-    chosen: list[tuple[str, str, float, str, str]] = []
-    for e in edges_ordered:
-        a, b = e[0], e[1]
-        ta = a in nodes
-        tb = b in nodes
-        if ta and tb:
-            chosen.append(e)
-        elif ta or tb:
-            other = b if ta else a
-            if other in nodes:
-                chosen.append(e)
-            elif len(nodes) < entity_cap:
-                nodes.add(other)
-                chosen.append(e)
-    return nodes, chosen
-
-
-def _select_reduced_cooccurrence(
-    edges: list[tuple[str, str, float, str, str]],
-    query: str,
-    entity_cap: int = MAX_ENTITY_NODES,
-) -> tuple[list[tuple[str, str, float, str, str]], set[str], str | None, bool]:
-    """
-    Choose a readable co-occurrence subgraph.
-
-    Returns (chosen_edges, entity_nodes, matched_query_node_or_none, was_reduced).
-    """
-    all_entity_nodes = _entity_nodes_from_edges(edges)
-    qnode = _resolve_query_entity_node(all_entity_nodes, query)
-    if qnode and not any(e[0] == qnode or e[1] == qnode for e in edges):
-        qnode = None
-
-    if qnode:
-        ordered = sorted(edges, key=lambda e: (0 if (e[0] == qnode or e[1] == qnode) else 1, -e[2]))
-        seed: set[str] = {qnode}
-    else:
-        ordered = sorted(edges, key=lambda e: -e[2])
-        if not ordered:
-            return [], set(), None, False
-        e0 = ordered[0]
-        seed = {e0[0], e0[1]}
-
-    nodes, chosen = _grow_coocc_subgraph(ordered, seed, entity_cap)
-
-    if len(nodes) < 2 and edges:
-        ordered2 = sorted(edges, key=lambda e: -e[2])
-        e0 = ordered2[0]
-        nodes, chosen = _grow_coocc_subgraph(ordered2, {e0[0], e0[1]}, entity_cap)
-        qnode = None
-
-    was_reduced = len(all_entity_nodes) > len(nodes) or len(edges) > len(chosen)
-    return chosen, nodes, qnode, was_reduced
-
-
 def build_entity_link_graph_figure(
     ranked: list[tuple[ChunkRecord, float]],
     edges: list[tuple[str, str, float, str, str]],
     query: str = "",
 ) -> tuple[go.Figure | None, str]:
-    """
-    Build a spider-web graph from weighted co-occurrence edges plus light case/source context.
-
-    Returns (figure, caption). caption is empty unless the graph was simplified for readability.
-    """
-    if not edges or not ranked:
+    if not edges:
         return None, ""
 
-    reduced_edges, entity_nodes, _, was_reduced = _select_reduced_cooccurrence(edges, query)
-    if not reduced_edges or not entity_nodes:
-        return None, ""
+    try:
+        reduced_edges = sorted(edges, key=lambda e: -float(e[2]))[:GRAPH_TOP_EDGES]
+        nodes: set[str] = {a for a, _, _, _, _ in reduced_edges} | {b for _, b, _, _, _ in reduced_edges}
+        if not nodes:
+            return None, GRAPH_FAIL_MSG
 
-    def _chunk_entity_keys(record: ChunkRecord) -> set[str]:
-        out: set[str] = set()
-        for h in extract_all_entities(record.text):
-            ek = _entity_key(h)
-            if ek:
-                out.add(ek)
-        return out
-
-    def _touches_reduced_entities(record: ChunkRecord) -> bool:
-        return bool(_chunk_entity_keys(record) & entity_nodes)
-
-    case_doc_ids: list[str] = []
-    seen_doc: set[str] = set()
-    for r, _ in ranked:
-        if r.doc_id in seen_doc or not _touches_reduced_entities(r):
-            continue
-        seen_doc.add(r.doc_id)
-        case_doc_ids.append(r.doc_id)
-        if len(case_doc_ids) >= MAX_CASE_NODES:
-            break
-
-    source_types = sorted(
-        {
-            r.source_type
-            for r, _ in ranked
-            if r.source_type and _touches_reduced_entities(r)
-        }
-    )
-
-    nodes: set[str] = set(entity_nodes)
-    case_hover: dict[str, str] = {}
-    for did in case_doc_ids:
-        if len(nodes) >= MAX_TOTAL_NODES:
-            break
-        nid = _case_node(did)
-        nodes.add(nid)
-        title = next((r.doc_title for r, _ in ranked if r.doc_id == did), did)
-        case_hover[nid] = f"{title} ({did})"
-    for st in source_types:
-        if len(nodes) >= MAX_TOTAL_NODES:
-            break
-        nodes.add(_source_node(st))
-
-    layout_weights: list[tuple[str, str, float]] = []
-    for a, b, s, _, _ in reduced_edges:
-        if a in nodes and b in nodes:
-            layout_weights.append((a, b, float(s)))
-    for r, _ in ranked:
-        if r.doc_id not in case_doc_ids:
-            continue
-        cid = _case_node(r.doc_id)
-        sid = _source_node(r.source_type)
-        for h in extract_all_entities(r.text):
-            ek = _entity_key(h)
-            if not ek or ek not in nodes:
-                continue
-            if cid in nodes:
-                layout_weights.append((ek, cid, 0.22))
-            if sid in nodes:
-                layout_weights.append((ek, sid, 0.16))
-
-    node_list = sorted(nodes)
-    pos = _fr_layout(node_list, _merge_edge_weights(layout_weights))
-
-    smax = max((s for _, _, s, _, _ in reduced_edges), default=1.0)
-    if smax <= 0:
-        smax = 1.0
-
-    fig = go.Figure()
-
-    # Context edges (case / source): thin, neutral (deduped)
-    ax_c, ay_c = [], []
-    drawn_ctx: set[tuple[str, str]] = set()
-    for r, _ in ranked:
-        if r.doc_id not in case_doc_ids:
-            continue
-        cid = _case_node(r.doc_id)
-        sid = _source_node(r.source_type)
-        for h in extract_all_entities(r.text):
-            ek = _entity_key(h)
-            if not ek or ek not in pos:
-                continue
-            x0, y0 = pos[ek]
-            if cid in pos:
-                key = tuple(sorted((ek, cid)))
-                if key not in drawn_ctx:
-                    drawn_ctx.add(key)
-                    x1, y1 = pos[cid]
-                    ax_c.extend([x0, x1, None])
-                    ay_c.extend([y0, y1, None])
-            if sid in pos:
-                key2 = tuple(sorted((ek, sid)))
-                if key2 not in drawn_ctx:
-                    drawn_ctx.add(key2)
-                    x2, y2 = pos[sid]
-                    ax_c.extend([x0, x2, None])
-                    ay_c.extend([y0, y2, None])
-    if ax_c:
-        fig.add_trace(
-            go.Scatter(
-                x=ax_c,
-                y=ay_c,
-                mode="lines",
-                line=dict(color="rgba(148,163,184,0.55)", width=1),
-                hoverinfo="skip",
-                showlegend=True,
-                name="Context (doc / source)",
-            )
-        )
-
-    # Co-occurrence edges: width from strength, dash from link type
-    buckets: dict[tuple[str, int], tuple[list[float], list[float]]] = defaultdict(lambda: ([], []))
-    for a, b, s, _lbl, lt in reduced_edges:
-        if a not in pos or b not in pos:
-            continue
-        dash = "solid" if lt == "direct" else "dash"
-        r = s / smax
-        if r >= 0.66:
-            wb = 2
-        elif r >= 0.33:
-            wb = 1
+        node_list = sorted(nodes)
+        n = len(node_list)
+        if n <= 12:
+            angles = np.linspace(0.0, 2.0 * np.pi, n, endpoint=False)
+            pos_arr = np.column_stack((np.cos(angles), np.sin(angles)))
         else:
-            wb = 0
-        key = (dash, wb)
-        xl, yl = buckets[key]
-        x0, y0 = pos[a]
-        x1, y1 = pos[b]
-        xl.extend([x0, x1, None])
-        yl.extend([y0, y1, None])
+            rng = np.random.default_rng(42)
+            pos_arr = rng.uniform(-1.2, 1.2, size=(n, 2))
+        pos_arr = np.nan_to_num(pos_arr, nan=0.0, posinf=0.0, neginf=0.0)
+        pos = {node_list[i]: (float(pos_arr[i, 0]), float(pos_arr[i, 1])) for i in range(n)}
 
-    for (dash, wb), (xl, yl) in buckets.items():
-        if not xl:
-            continue
-        w = 2.0 + wb * 1.35
-        kind = "direct" if dash == "solid" else "indirect"
-        fig.add_trace(
-            go.Scatter(
-                x=xl,
-                y=yl,
-                mode="lines",
-                line=dict(color="rgba(30,64,175,0.78)", width=w, dash=dash),
-                hoverinfo="skip",
-                showlegend=True,
-                name=f"Co-occurrence ({kind}, weight {wb + 1})",
+        fig = go.Figure()
+        edge_trace_count = 0
+        for a, b, strength, _lbl, link_type in reduced_edges:
+            if a not in pos or b not in pos:
+                continue
+            x0, y0 = pos[a]
+            x1, y1 = pos[b]
+            dash = "solid" if link_type == "direct" else "dash"
+            width = max(2.0, float(strength) * 2.0)
+            fig.add_trace(
+                go.Scatter(
+                    x=[x0, x1],
+                    y=[y0, y1],
+                    mode="lines",
+                    line=dict(color="#0f172a", width=width, dash=dash),
+                    hoverinfo="skip",
+                )
             )
-        )
+            edge_trace_count += 1
 
-    kinds = ("person", "vehicle", "phone", "case", "source", "other")
-    for kind in kinds:
-        ns = [n for n in node_list if _node_kind(n) == kind]
-        if not ns:
-            continue
-        hover = []
-        for n in ns:
-            if n.startswith("case:"):
-                hover.append(case_hover.get(n, n))
-            elif n.startswith("source:"):
-                hover.append(f"Source channel: {n.split(':', 1)[1]}")
-            else:
-                hover.append(n)
         fig.add_trace(
             go.Scatter(
-                x=[pos[n][0] for n in ns],
-                y=[pos[n][1] for n in ns],
+                x=[pos[nid][0] for nid in node_list],
+                y=[pos[nid][1] for nid in node_list],
                 mode="markers+text",
-                name=kind,
-                text=[_short_label(n) for n in ns],
+                marker=dict(size=20, color="#2563eb", line=dict(width=1, color="#0f172a")),
+                text=node_list,
                 textposition="top center",
-                textfont=dict(size=10, color="#1e293b"),
-                marker=dict(
-                    symbol=_marker_symbol(kind),
-                    size=16 if kind != "case" else 18,
-                    color=_marker_color(kind),
-                    line=dict(width=1, color="#0f172a"),
-                ),
-                hovertext=hover,
+                textfont=dict(size=11, color="#0f172a"),
                 hoverinfo="text",
+                hovertext=node_list,
             )
         )
 
-    fig.update_layout(
-        title=dict(text="Relationship graph (current retrieval only)", font=dict(size=14)),
-        showlegend=True,
-        legend=dict(orientation="h", yanchor="bottom", y=-0.22, x=0),
-        xaxis=dict(visible=False, scaleanchor="y", scaleratio=1, fixedrange=True),
-        yaxis=dict(visible=False, fixedrange=True),
-        plot_bgcolor="#f8fafc",
-        margin=dict(l=8, r=8, t=40, b=80),
-        height=520,
-    )
-    note = SIMPLIFIED_CAPTION if was_reduced else ""
-    return fig, note
+        # Fallback: if edge traces failed to draw, keep a nodes-only graph visible.
+        if edge_trace_count == 0 and reduced_edges:
+            fig = go.Figure()
+            fig.add_trace(
+                go.Scatter(
+                    x=[pos[nid][0] for nid in node_list],
+                    y=[pos[nid][1] for nid in node_list],
+                    mode="markers+text",
+                    marker=dict(size=20, color="#2563eb", line=dict(width=1, color="#0f172a")),
+                    text=node_list,
+                    textposition="top center",
+                    textfont=dict(size=11, color="#0f172a"),
+                    hoverinfo="text",
+                    hovertext=node_list,
+                )
+            )
+
+        fig.update_layout(
+            title=dict(text="Relationship graph (current retrieval only)", font=dict(size=14, color="#0f172a")),
+            xaxis=dict(range=[-2, 2], visible=False),
+            yaxis=dict(range=[-2, 2], visible=False),
+            showlegend=False,
+            plot_bgcolor="#ffffff",
+            paper_bgcolor="#f8fafc",
+            margin=dict(l=20, r=20, t=48, b=20),
+            height=520,
+        )
+        return fig, SIMPLIFIED_CAPTION
+    except Exception:
+        # Last-resort fallback: render nodes from raw edges.
+        fallback_nodes: set[str] = {a for a, _, _, _, _ in edges} | {b for _, b, _, _, _ in edges}
+        if not fallback_nodes:
+            return None, GRAPH_FAIL_MSG
+        node_list = sorted(fallback_nodes)
+        n = len(node_list)
+        angles = np.linspace(0.0, 2.0 * np.pi, n, endpoint=False) if n > 1 else np.array([0.0])
+        pos_arr = np.column_stack((np.cos(angles), np.sin(angles))) if n > 1 else np.array([[0.0, 0.0]])
+        pos_arr = np.nan_to_num(pos_arr, nan=0.0, posinf=0.0, neginf=0.0)
+        fig = go.Figure()
+        fig.add_trace(
+            go.Scatter(
+                x=[float(pos_arr[i, 0]) for i in range(n)],
+                y=[float(pos_arr[i, 1]) for i in range(n)],
+                mode="markers+text",
+                marker=dict(size=20, color="#2563eb", line=dict(width=1, color="#0f172a")),
+                text=node_list,
+                textposition="top center",
+                textfont=dict(size=11, color="#0f172a"),
+                hoverinfo="text",
+                hovertext=node_list,
+            )
+        )
+        fig.update_layout(
+            title=dict(text="Relationship graph (current retrieval only)", font=dict(size=14, color="#0f172a")),
+            xaxis=dict(range=[-2, 2], visible=False),
+            yaxis=dict(range=[-2, 2], visible=False),
+            showlegend=False,
+            plot_bgcolor="#ffffff",
+            paper_bgcolor="#f8fafc",
+            margin=dict(l=20, r=20, t=48, b=20),
+            height=520,
+        )
+        return fig, SIMPLIFIED_CAPTION
