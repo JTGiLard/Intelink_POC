@@ -30,6 +30,8 @@ _MAKE_MODEL = re.compile(
     r"\b(Honda|Toyota|Mercedes|BMW|Audi|Hyundai|Kia)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\b",
 )
 
+_PERSON_FULLNAME = re.compile(r"\b[A-Z][a-z]+\s+[A-Z][a-z]+\b")
+
 
 @dataclass
 class EntityHit:
@@ -84,6 +86,10 @@ def extract_entities_regex(text: str) -> list[EntityHit]:
 
     for m in _MAKE_MODEL.finditer(text):
         add("vehicle", f"{m.group(1)} {m.group(2)}", m.start(), m.end())
+
+    # Regex fallback for full names when spaCy PERSON extraction is unavailable.
+    for m in _PERSON_FULLNAME.finditer(text):
+        add("person", m.group(0), m.start(), m.end())
 
     return hits
 
