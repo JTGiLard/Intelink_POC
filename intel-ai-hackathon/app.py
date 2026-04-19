@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import re
 from collections import Counter
+from difflib import SequenceMatcher
 from pathlib import Path
 
 import pandas as pd
@@ -192,6 +193,30 @@ def _summary_subject(query: str, summary: EntitySummary) -> str:
     return top[0][0] if top else "this result set"
 
 
+def _is_person_like_two_word_query(query: str) -> bool:
+    q = _person_phrase_from_query(query).strip()
+    return bool(re.fullmatch(r"[A-Za-z][A-Za-z'-]*\s+[A-Za-z][A-Za-z'-]*", q))
+
+
+def find_closest_person_match(query: str, summary: EntitySummary) -> str | None:
+    q = _person_phrase_from_query(query).strip()
+    if not q:
+        return None
+    candidates = summary.persons.most_common(20)
+    if not candidates:
+        return None
+    ql = q.lower()
+
+    def rank(name: str, freq: int) -> tuple[float, int]:
+        # Favor name frequency first, with light string-similarity tie-breaking.
+        sim = SequenceMatcher(None, ql, name.lower()).ratio()
+        return (freq + sim * 1.5, freq)
+
+    best_name, _ = max(candidates, key=lambda item: rank(item[0], item[1]))
+    best_sim = SequenceMatcher(None, ql, best_name.lower()).ratio()
+    return best_name if best_sim >= 0.45 or (summary.persons[best_name] >= 2) else None
+
+
 def _source_mix_sentence(ranked: list[tuple[ChunkRecord, float]]) -> str:
     counts = Counter(r.source_type for r, _ in ranked)
     if not counts:
@@ -250,6 +275,16 @@ def build_ai_summary(
 ) -> str:
     if not ranked:
         return "Nothing came back for this query, so there is no profile to summarize yet."
+
+    if _is_person_like_two_word_query(query) and not has_exact_full_name_hit(ranked, query):
+        q = _person_phrase_from_query(query).strip()
+        closest = find_closest_person_match(query, summary)
+        if closest:
+            return (
+                f"No exact match was found for {q}. Closest related match: {closest}. "
+                "Showing nearby evidence for review."
+            )
+        return f"No exact match was found for {q}. Showing semantically related evidence."
 
     subject = _summary_subject(query, summary)
     n = len(ranked)
