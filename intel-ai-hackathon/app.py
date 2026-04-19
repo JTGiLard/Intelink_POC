@@ -198,6 +198,22 @@ def _is_person_like_two_word_query(query: str) -> bool:
     return bool(re.fullmatch(r"[A-Za-z][A-Za-z'-]*\s+[A-Za-z][A-Za-z'-]*", q))
 
 
+def _is_single_token_person_like_query(query: str) -> bool:
+    q = _person_phrase_from_query(query).strip()
+    return bool(re.fullmatch(r"[A-Za-z][A-Za-z'-]*", q))
+
+
+def _has_exact_person_token_match(summary: EntitySummary, token: str) -> bool:
+    tk = token.strip().lower()
+    if not tk:
+        return False
+    for name in summary.persons:
+        parts = [p.strip().lower() for p in re.split(r"\s+", name.strip()) if p.strip()]
+        if tk in parts:
+            return True
+    return False
+
+
 def find_closest_person_match(query: str, summary: EntitySummary) -> str | None:
     q = _person_phrase_from_query(query).strip()
     if not q:
@@ -215,6 +231,50 @@ def find_closest_person_match(query: str, summary: EntitySummary) -> str | None:
     best_name, _ = max(candidates, key=lambda item: rank(item[0], item[1]))
     best_sim = SequenceMatcher(None, ql, best_name.lower()).ratio()
     return best_name if best_sim >= 0.45 or (summary.persons[best_name] >= 2) else None
+
+
+def find_surname_token_suggestion(query: str, summary: EntitySummary) -> str | None:
+    token = _person_phrase_from_query(query).strip().lower()
+    if not token:
+        return None
+    surname_counts: Counter[str] = Counter()
+    for name, freq in summary.persons.items():
+        parts = [p for p in re.split(r"\s+", name.strip()) if p]
+        if len(parts) >= 2:
+            surname_counts[parts[-1].lower()] += freq
+    if not surname_counts:
+        return None
+
+    def score(surname: str, freq: int) -> float:
+        return freq + SequenceMatcher(None, token, surname).ratio() * 1.8
+
+    best_surname, best_freq = max(surname_counts.items(), key=lambda item: score(item[0], item[1]))
+    sim = SequenceMatcher(None, token, best_surname).ratio()
+    if sim < 0.62 and best_freq < 2:
+        return None
+    return best_surname[:1].upper() + best_surname[1:]
+
+
+def find_alias_suggestion(query: str, summary: EntitySummary) -> str | None:
+    token = _person_phrase_from_query(query).strip().lower()
+    if not token:
+        return None
+    alias_candidates = [
+        (name, freq)
+        for name, freq in summary.persons.items()
+        if len([p for p in re.split(r"\s+", name.strip()) if p]) == 1
+    ]
+    if not alias_candidates:
+        return None
+
+    def score(name: str, freq: int) -> float:
+        return freq + SequenceMatcher(None, token, name.lower()).ratio() * 2.0
+
+    best_name, best_freq = max(alias_candidates, key=lambda item: score(item[0], item[1]))
+    sim = SequenceMatcher(None, token, best_name.lower()).ratio()
+    if sim < 0.68 and best_freq < 2:
+        return None
+    return best_name
 
 
 def _source_mix_sentence(ranked: list[tuple[ChunkRecord, float]]) -> str:
@@ -285,6 +345,22 @@ def build_ai_summary(
                 "Showing nearby evidence for review."
             )
         return f"No exact match was found for {q}. Showing semantically related evidence."
+
+    if _is_single_token_person_like_query(query):
+        q = _person_phrase_from_query(query).strip()
+        if q and not _has_exact_person_token_match(summary, q):
+            surname_suggestion = find_surname_token_suggestion(query, summary)
+            if surname_suggestion:
+                return (
+                    f"No exact match was found for '{q}'. Did you mean '{surname_suggestion}'? "
+                    "Showing semantically related evidence only."
+                )
+            alias_suggestion = find_alias_suggestion(query, summary)
+            if alias_suggestion:
+                return (
+                    f"No exact match was found for '{q}'. Closest related alias: {alias_suggestion}. "
+                    "Showing semantically related evidence only."
+                )
 
     subject = _summary_subject(query, summary)
     n = len(ranked)
