@@ -388,11 +388,11 @@ def main() -> None:
         if not edges:
             st.write("No edges found for this result set.")
         else:
-            gfig, gskip = build_entity_link_graph_figure(ranked, edges)
+            gfig, gnote = build_entity_link_graph_figure(ranked, edges, query)
             if gfig is not None:
                 st.plotly_chart(gfig, use_container_width=True)
-            elif gskip:
-                st.caption(gskip)
+                if gnote:
+                    st.caption(gnote)
             df_e = pd.DataFrame(
                 edges,
                 columns=["Entity A", "Entity B", "Strength", "Strength label", "Link type"],

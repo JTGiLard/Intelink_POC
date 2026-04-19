@@ -13,8 +13,12 @@ from intelligence.entities import extract_all_entities
 from intelligence.index_store import ChunkRecord
 
 
-MAX_GRAPH_NODES = 26
-MAX_CASE_NODES = 6
+# Readable graph size: co-occurrence entities (cap), then case/source hubs up to MAX_TOTAL_NODES.
+MAX_ENTITY_NODES = 14
+MAX_TOTAL_NODES = 16
+MAX_CASE_NODES = 4
+
+SIMPLIFIED_CAPTION = "Showing simplified relationship graph for readability."
 
 
 def _case_node(doc_id: str) -> str:
@@ -125,22 +129,105 @@ def _merge_edge_weights(pairs: list[tuple[str, str, float]]) -> list[tuple[str, 
     return [(a, b, w) for (a, b), w in merged.items()]
 
 
+def _entity_nodes_from_edges(edges: list[tuple[str, str, float, str, str]]) -> set[str]:
+    out: set[str] = set()
+    for a, b, *_ in edges:
+        out.add(a)
+        out.add(b)
+    return out
+
+
+def _resolve_query_entity_node(entity_nodes: set[str], query: str) -> str | None:
+    q = query.strip()
+    if not q:
+        return None
+    ql = q.lower()
+    for n in entity_nodes:
+        if _node_kind(n) not in ("person", "vehicle", "phone"):
+            continue
+        rest = n.split(":", 1)[1].strip()
+        if rest.lower() == ql:
+            return n
+    return None
+
+
+def _grow_coocc_subgraph(
+    edges_ordered: list[tuple[str, str, float, str, str]],
+    seed_nodes: set[str],
+    entity_cap: int,
+) -> tuple[set[str], list[tuple[str, str, float, str, str]]]:
+    """Greedy add co-occurrence edges that touch the growing set until entity node cap."""
+    nodes = set(seed_nodes)
+    chosen: list[tuple[str, str, float, str, str]] = []
+    for e in edges_ordered:
+        a, b = e[0], e[1]
+        ta = a in nodes
+        tb = b in nodes
+        if ta and tb:
+            chosen.append(e)
+        elif ta or tb:
+            other = b if ta else a
+            if other in nodes:
+                chosen.append(e)
+            elif len(nodes) < entity_cap:
+                nodes.add(other)
+                chosen.append(e)
+    return nodes, chosen
+
+
+def _select_reduced_cooccurrence(
+    edges: list[tuple[str, str, float, str, str]],
+    query: str,
+    entity_cap: int = MAX_ENTITY_NODES,
+) -> tuple[list[tuple[str, str, float, str, str]], set[str], str | None, bool]:
+    """
+    Choose a readable co-occurrence subgraph.
+
+    Returns (chosen_edges, entity_nodes, matched_query_node_or_none, was_reduced).
+    """
+    all_entity_nodes = _entity_nodes_from_edges(edges)
+    qnode = _resolve_query_entity_node(all_entity_nodes, query)
+    if qnode and not any(e[0] == qnode or e[1] == qnode for e in edges):
+        qnode = None
+
+    if qnode:
+        ordered = sorted(edges, key=lambda e: (0 if (e[0] == qnode or e[1] == qnode) else 1, -e[2]))
+        seed: set[str] = {qnode}
+    else:
+        ordered = sorted(edges, key=lambda e: -e[2])
+        if not ordered:
+            return [], set(), None, False
+        e0 = ordered[0]
+        seed = {e0[0], e0[1]}
+
+    nodes, chosen = _grow_coocc_subgraph(ordered, seed, entity_cap)
+
+    if len(nodes) < 2 and edges:
+        ordered2 = sorted(edges, key=lambda e: -e[2])
+        e0 = ordered2[0]
+        nodes, chosen = _grow_coocc_subgraph(ordered2, {e0[0], e0[1]}, entity_cap)
+        qnode = None
+
+    was_reduced = len(all_entity_nodes) > len(nodes) or len(edges) > len(chosen)
+    return chosen, nodes, qnode, was_reduced
+
+
 def build_entity_link_graph_figure(
     ranked: list[tuple[ChunkRecord, float]],
     edges: list[tuple[str, str, float, str, str]],
+    query: str = "",
 ) -> tuple[go.Figure | None, str]:
     """
     Build a spider-web graph from weighted co-occurrence edges plus light case/source context.
 
-    Returns (figure, skip_reason). skip_reason is empty when a figure is returned.
+    Returns (figure, caption). caption is empty unless the graph was simplified for readability.
     """
     if not edges or not ranked:
         return None, ""
 
-    edge_endpoints: set[str] = set()
-    for a, b, *_ in edges:
-        edge_endpoints.add(a)
-        edge_endpoints.add(b)
+    reduced_edges, entity_nodes, _, was_reduced = _select_reduced_cooccurrence(edges, query)
+    if not reduced_edges or not entity_nodes:
+        return None, ""
 
     def _chunk_entity_keys(record: ChunkRecord) -> set[str]:
         out: set[str] = set()
@@ -150,13 +237,13 @@ def build_entity_link_graph_figure(
                 out.add(ek)
         return out
 
-    def _touches_endpoints(record: ChunkRecord) -> bool:
-        return bool(_chunk_entity_keys(record) & edge_endpoints)
+    def _touches_reduced_entities(record: ChunkRecord) -> bool:
+        return bool(_chunk_entity_keys(record) & entity_nodes)
 
     case_doc_ids: list[str] = []
     seen_doc: set[str] = set()
     for r, _ in ranked:
-        if r.doc_id in seen_doc or not _touches_endpoints(r):
+        if r.doc_id in seen_doc or not _touches_reduced_entities(r):
             continue
         seen_doc.add(r.doc_id)
         case_doc_ids.append(r.doc_id)
@@ -167,29 +254,26 @@ def build_entity_link_graph_figure(
         {
             r.source_type
             for r, _ in ranked
-            if r.source_type and _touches_endpoints(r)
+            if r.source_type and _touches_reduced_entities(r)
         }
     )
 
-    nodes: set[str] = set(edge_endpoints)
+    nodes: set[str] = set(entity_nodes)
     case_hover: dict[str, str] = {}
     for did in case_doc_ids:
+        if len(nodes) >= MAX_TOTAL_NODES:
+            break
         nid = _case_node(did)
         nodes.add(nid)
         title = next((r.doc_title for r, _ in ranked if r.doc_id == did), did)
         case_hover[nid] = f"{title} ({did})"
     for st in source_types:
+        if len(nodes) >= MAX_TOTAL_NODES:
+            break
         nodes.add(_source_node(st))
 
-    if len(nodes) > MAX_GRAPH_NODES:
-        return (
-            None,
-            f"Graph hidden: too many nodes for a readable view ({len(nodes)} > {MAX_GRAPH_NODES}). "
-            "Try a narrower search or fewer results.",
-        )
-
     layout_weights: list[tuple[str, str, float]] = []
-    for a, b, s, _, _ in edges:
+    for a, b, s, _, _ in reduced_edges:
         if a in nodes and b in nodes:
             layout_weights.append((a, b, float(s)))
     for r, _ in ranked:
@@ -209,7 +293,7 @@ def build_entity_link_graph_figure(
     node_list = sorted(nodes)
     pos = _fr_layout(node_list, _merge_edge_weights(layout_weights))
 
-    smax = max((s for _, _, s, _, _ in edges), default=1.0)
+    smax = max((s for _, _, s, _, _ in reduced_edges), default=1.0)
     if smax <= 0:
         smax = 1.0
 
@@ -257,7 +341,7 @@ def build_entity_link_graph_figure(
 
     # Co-occurrence edges: width from strength, dash from link type
     buckets: dict[tuple[str, int], tuple[list[float], list[float]]] = defaultdict(lambda: ([], []))
-    for a, b, s, _lbl, lt in edges:
+    for a, b, s, _lbl, lt in reduced_edges:
         if a not in pos or b not in pos:
             continue
         dash = "solid" if lt == "direct" else "dash"
@@ -335,4 +419,5 @@ def build_entity_link_graph_figure(
         margin=dict(l=8, r=8, t=40, b=80),
         height=520,
     )
-    return fig, ""
+    note = SIMPLIFIED_CAPTION if was_reduced else ""
+    return fig, note
