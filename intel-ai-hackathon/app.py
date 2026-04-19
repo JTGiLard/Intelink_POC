@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+from collections import Counter
 from pathlib import Path
 
 import pandas as pd
@@ -24,6 +25,7 @@ from intelligence.index_store import (
     save_cache,
     try_load_cache,
 )
+from intelligence.link_graph import build_entity_link_graph_figure
 from intelligence.loaders import iter_documents
 from intelligence.timeline import TimelineEvent, extract_timeline_events, timeline_sort_key
 
@@ -81,6 +83,30 @@ def build_or_load_index(data_root: Path, use_cache: bool) -> FaissIndexStore:
     return store
 
 
+def _person_name_rank_adjust(record_text: str, query_lower: str) -> float:
+    """Extra score for person-style queries: exact phrase, first-name-only, surname mismatch."""
+    tokens = [t for t in query_lower.split() if len(t) > 1]
+    if len(tokens) < 2:
+        return 0.0
+    phrase = " ".join(tokens)
+    text_l = record_text.lower()
+    adj = 0.0
+    if phrase in text_l:
+        adj += 0.22
+        return adj
+    first, last = tokens[0], tokens[-1]
+    if re.search(rf"(?i)\b{re.escape(first)}\b", text_l):
+        adj += 0.055
+    for m in re.finditer(rf"(?i)\\b{re.escape(first)}\\s+(\\w{{2,}})\\b", record_text):
+        word = m.group(1)
+        if word.lower() == last:
+            continue
+        if word.isalpha() and word[:1].isupper() and len(word) >= 3:
+            adj -= 0.14
+            break
+    return adj
+
+
 def hybrid_rank(
     hits: list[tuple[ChunkRecord, float]],
     query: str,
@@ -89,6 +115,8 @@ def hybrid_rank(
     q = query.strip().lower()
     if not q:
         return hits
+    tokens = [t for t in q.split() if len(t) > 1]
+    person_style = len(tokens) >= 2
     rescored: list[tuple[ChunkRecord, float]] = []
     for r, s in hits:
         text_l = r.text.lower()
@@ -97,21 +125,36 @@ def hybrid_rank(
             parts = [p for p in q.split() if len(p) > 2]
             if parts and all(p in text_l for p in parts):
                 bonus = max(bonus, keyword_boost * 0.85)
+        if person_style:
+            bonus += _person_name_rank_adjust(r.text, q)
+        elif len(tokens) == 1:
+            t0 = tokens[0]
+            if re.search(rf"(?i)\b{re.escape(t0)}\b", text_l):
+                bonus += 0.035
         rescored.append((r, s + bonus))
     rescored.sort(key=lambda x: -x[1])
     return rescored
 
 
+def has_exact_full_name_hit(ranked: list[tuple[ChunkRecord, float]], query: str) -> bool:
+    q = query.strip().lower()
+    tokens = [t for t in q.split() if len(t) > 1]
+    if len(tokens) < 2:
+        return True
+    phrase = " ".join(tokens)
+    return any(phrase in r.text.lower() for r, _ in ranked)
+
+
 def aggregate_dashboard(
     ranked: list[tuple[ChunkRecord, float]],
     query: str,
-) -> tuple[EntitySummary, list[tuple[str, str, int]], list[TimelineEvent]]:
-    texts_entities: list[tuple[str, list]] = []
+) -> tuple[EntitySummary, list[tuple[str, str, float, str, str]], list[TimelineEvent]]:
+    texts_entities: list[tuple[str, list, str]] = []
     all_hits = []
     timeline: list[TimelineEvent] = []
     for r, _ in ranked:
         ents = extract_all_entities(r.text)
-        texts_entities.append((r.text, ents))
+        texts_entities.append((r.text, ents, r.source_type))
         all_hits.extend(ents)
         timeline.extend(extract_timeline_events(r))
     summary = summarize_entities(all_hits)
@@ -127,76 +170,106 @@ def highlight_query(text: str, query: str) -> str:
     return re.sub(f"({esc})", r"**\1**", text, flags=re.IGNORECASE)
 
 
-def _format_list(values: list[str], empty: str, limit: int = 3) -> str:
-    if not values:
-        return empty
-    shown = values[:limit]
-    suffix = " and others" if len(values) > limit else ""
-    if len(shown) == 1:
-        return f"{shown[0]}{suffix}"
-    if len(shown) == 2:
-        return f"{shown[0]} and {shown[1]}{suffix}"
-    return f"{', '.join(shown[:-1])}, and {shown[-1]}{suffix}"
+def _summary_subject(query: str, summary: EntitySummary) -> str:
+    q = query.strip()
+    if q:
+        return q
+    top = summary.persons.most_common(1)
+    return top[0][0] if top else "this result set"
 
 
-def _source_label(source_type: str, count: int) -> str:
-    if source_type == "whatsapp":
-        return "WhatsApp"
-    if source_type == "report":
-        return "a report" if count == 1 else "reports"
-    if source_type == "email":
-        return "an email" if count == 1 else "emails"
-    return source_type
+def _source_mix_sentence(ranked: list[tuple[ChunkRecord, float]]) -> str:
+    counts = Counter(r.source_type for r, _ in ranked)
+    if not counts:
+        return "sources that could not be classified"
+    parts: list[str] = []
+    for st, n in counts.most_common():
+        if st == "whatsapp":
+            parts.append(f"{n} WhatsApp excerpt{'s' if n != 1 else ''}")
+        elif st == "report":
+            parts.append(f"{n} report{'s' if n != 1 else ''}")
+        elif st == "email":
+            parts.append(f"{n} email{'s' if n != 1 else ''}")
+        else:
+            parts.append(f"{n} {st} segment{'s' if n != 1 else ''}")
+    if len(parts) == 1:
+        return parts[0]
+    if len(parts) == 2:
+        return f"{parts[0]} and {parts[1]}"
+    return f"{', '.join(parts[:-1])}, plus {parts[-1]}"
 
 
-def _format_sources_plain(source_types: list[str]) -> str:
-    if not source_types:
-        return ""
-    counts: dict[str, int] = {}
-    for s in source_types:
-        counts[s] = counts.get(s, 0) + 1
-    ordered = list(dict.fromkeys(source_types))
-    labels = [_source_label(s, counts.get(s, 0)) for s in ordered]
-    return _format_list(labels, "", limit=3)
+def _rule_based_next_action(
+    summary: EntitySummary,
+    timeline: list[TimelineEvent],
+    ranked: list[tuple[ChunkRecord, float]],
+) -> str:
+    if timeline:
+        return (
+            "Open the activity timeline and align each dated point with the matching "
+            "evidence snippet so the sequence reads cleanly for briefings."
+        )
+    srcs = {r.source_type for r, _ in ranked}
+    if len(srcs) > 1:
+        return (
+            "Compare language and facts across source types in the evidence list "
+            "to see where the accounts agree or diverge."
+        )
+    if summary.vehicles:
+        return (
+            "Take the strongest vehicle or plate hits and check them against "
+            "parking, toll, or fleet records if you have access."
+        )
+    if summary.phones:
+        return (
+            "Validate the surfaced numbers against call logs or subscriber data "
+            "before treating them as confirmed contact points."
+        )
+    return (
+        "Walk the highest-ranked evidence in order and mark lines that need "
+        "corroboration or follow-up with a human reviewer."
+    )
 
 
 def build_ai_summary(
     ranked: list[tuple[ChunkRecord, float]], summary: EntitySummary, timeline: list[TimelineEvent], query: str
 ) -> str:
-    _ = timeline
     if not ranked:
-        return "No records were returned for this query."
+        return "Nothing came back for this query, so there is no profile to summarize yet."
 
-    main_person = summary.persons.most_common(1)
-    subject = ""
-    if main_person and main_person[0][1] >= 2:
-        subject = main_person[0][0]
-    elif query.strip():
-        subject = query.strip()
-
-    source_types = [r.source_type for r, _ in ranked]
+    subject = _summary_subject(query, summary)
+    n = len(ranked)
+    mix = _source_mix_sentence(ranked)
     vehicles = [name for name, _ in summary.vehicles.most_common(2)]
     phones = [name for name, _ in summary.phones.most_common(2)]
 
-    sentences: list[str] = []
-    sources_text = _format_sources_plain(source_types)
-    if subject:
-        if sources_text:
-            sentences.append(f"{subject} appears across {len(ranked)} records from {sources_text}.")
-        else:
-            sentences.append(f"{subject} appears across {len(ranked)} records.")
-    elif sources_text:
-        sentences.append(f"{len(ranked)} records were returned from {sources_text}.")
-    else:
-        sentences.append(f"{len(ranked)} records were returned.")
+    lead = (
+        f"The main subject is {subject}. "
+        f"This view is built from {n} evidence record{'s' if n != 1 else ''}, "
+        f"drawn from {mix}."
+    )
 
+    detail_parts: list[str] = []
     if vehicles:
-        sentences.append(f"Linked vehicles include {_format_list(vehicles, '', limit=2)}.")
+        if len(vehicles) == 1:
+            detail_parts.append(f"the vehicle or plate signal {vehicles[0]}")
+        else:
+            detail_parts.append(f"vehicle or plate signals {vehicles[0]} and {vehicles[1]}")
     if phones:
-        sentences.append(f"Associated phone numbers include {_format_list(phones, '', limit=2)}.")
+        if len(phones) == 1:
+            detail_parts.append(f"the number {phones[0]}")
+        else:
+            detail_parts.append(f"numbers {phones[0]} and {phones[1]}")
+    if detail_parts:
+        if len(detail_parts) == 1:
+            middle = f" Along the way, {detail_parts[0]} stood out in the text."
+        else:
+            middle = f" Along the way, {detail_parts[0]} and {detail_parts[1]} stood out in the text."
+    else:
+        middle = " No strong vehicle or phone anchors showed up in this slice."
 
-    sentences.append("Recommended next step: review linked entities and gather corroborating records.")
-    return " ".join(sentences)
+    closing = f" Suggested next move: {_rule_based_next_action(summary, timeline, ranked)}"
+    return lead + middle + closing
 
 
 def main() -> None:
@@ -214,12 +287,10 @@ def main() -> None:
         st.error("Set `OPENAI_API_KEY` in a `.env` file or your environment.")
         st.stop()
 
-    spacy_status = "fallback"
     try:
-        spacy_status = get_spacy_ready()
+        _ = get_spacy_ready()
     except Exception:
-        spacy_status = "fallback"
-    _ = spacy_status
+        pass
     st.sidebar.info("Demo mode: fast entity extraction enabled.")
 
     if not data_root.is_dir():
@@ -266,9 +337,15 @@ def main() -> None:
     summary, edges, timeline = aggregate_dashboard(ranked, query)
     st.subheader("AI Summary")
     st.write(build_ai_summary(ranked, summary, timeline, query))
+    q_tokens = [t for t in query.strip().lower().split() if len(t) > 1]
+    if len(q_tokens) >= 2 and not has_exact_full_name_hit(ranked, query):
+        st.info(
+            "No evidence snippet contains an exact full-name match for your query; "
+            "ranked results may still include partial mentions or similarly named people."
+        )
 
     res_tab, ent_tab, rel_tab, time_tab = st.tabs(
-        ["Search results", "Entity summary", "Relationship links", "Timeline"]
+        ["Evidence", "Entity Profile", "Link Analysis", "Activity Timeline"]
     )
 
     with res_tab:
@@ -304,18 +381,29 @@ def main() -> None:
 
     with rel_tab:
         st.subheader("Co-occurrence in retrieved chunks")
-        st.caption("Pairs that appear together in the same text segment; stronger links mean more joint mentions.")
+        st.caption(
+            "Same-chunk pairs only. Strength blends co-occurrence count, span proximity inside each chunk, "
+            "and a small boost when the pair appears across more than one source type."
+        )
         if not edges:
             st.write("No edges found for this result set.")
         else:
-            df_e = pd.DataFrame(edges, columns=["Entity A", "Entity B", "Weight"])
+            gfig, gskip = build_entity_link_graph_figure(ranked, edges)
+            if gfig is not None:
+                st.plotly_chart(gfig, use_container_width=True)
+            elif gskip:
+                st.caption(gskip)
+            df_e = pd.DataFrame(
+                edges,
+                columns=["Entity A", "Entity B", "Strength", "Strength label", "Link type"],
+            )
             st.dataframe(df_e, use_container_width=True, height=420)
             st.subheader("Strongest links")
-            for a, b, w in edges[:12]:
-                st.write(f"- **{a}** ↔ **{b}** (weight {w})")
+            for a, b, s, lbl, lt in edges[:12]:
+                st.write(f"- **{a}** ↔ **{b}** — strength {s} ({lbl}, {lt})")
 
     with time_tab:
-        st.subheader("Chronology from retrieved content")
+        st.subheader("Activity timeline from retrieved content")
         if not timeline:
             st.write("No dated events parsed from this result set.")
         else:

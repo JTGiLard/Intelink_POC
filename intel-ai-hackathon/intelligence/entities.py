@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
@@ -94,13 +95,18 @@ def _get_nlp():
     global _nlp
     if _nlp is None:
         try:
+            import warnings
+
             import spacy
         except Exception:
             _nlp = False
             return None
 
         try:
-            _nlp = spacy.load("en_core_web_sm")
+            logging.getLogger("spacy").setLevel(logging.ERROR)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                _nlp = spacy.load("en_core_web_sm")
         except OSError:
             _nlp = False
             return None
@@ -165,23 +171,95 @@ def merge_summaries(*summaries: EntitySummary) -> EntitySummary:
     return out
 
 
+def _entity_key(h: EntityHit) -> str:
+    return f"{h.label}:{h.text.strip()}"
+
+
+def _span_gap_chars(h1: EntityHit, h2: EntityHit) -> int:
+    lo1, hi1 = h1.span_start, h1.span_end
+    lo2, hi2 = h2.span_start, h2.span_end
+    if hi1 < lo2:
+        return lo2 - hi1
+    if hi2 < lo1:
+        return lo1 - hi2
+    return 0
+
+
+def _chunk_pair_min_gaps(hits: list[EntityHit]) -> dict[tuple[str, str], int]:
+    """Per chunk, smallest character gap between spans for each unordered entity pair."""
+    out: dict[tuple[str, str], int] = {}
+    hits_f = [h for h in hits if len(h.text.strip()) > 1]
+    for i in range(len(hits_f)):
+        for j in range(i + 1, len(hits_f)):
+            ka, kb = _entity_key(hits_f[i]), _entity_key(hits_f[j])
+            if ka == kb:
+                continue
+            a, b = (ka, kb) if ka <= kb else (kb, ka)
+            g = _span_gap_chars(hits_f[i], hits_f[j])
+            k = (a, b)
+            if k not in out or g < out[k]:
+                out[k] = g
+    return out
+
+
 def cooccurrence_edges(
-    texts_with_entities: list[tuple[str, list[EntityHit]]],
+    chunks_with_entities: list[tuple[str, list[EntityHit], str | None]],
     min_weight: int = 1,
-) -> list[tuple[str, str, int]]:
-    """Return weighted undirected edges as (label_a, label_b, weight) with labels like `person:John Tan`."""
-    edge_weights: defaultdict[tuple[str, str], int] = defaultdict(int)
-    for _, hits in texts_with_entities:
-        names = sorted(
-            {f"{h.label}:{h.text.strip()}" for h in hits if len(h.text.strip()) > 1},
-            key=lambda x: x.lower(),
-        )
-        for i in range(len(names)):
-            for j in range(i + 1, len(names)):
-                a, b = names[i], names[j]
-                if a > b:
-                    a, b = b, a
-                edge_weights[(a, b)] += 1
-    edges = [(a, b, w) for (a, b), w in edge_weights.items() if w >= min_weight]
+) -> list[tuple[str, str, float, str, str]]:
+    """
+    Same-chunk co-occurrence edges with deterministic composite strength.
+
+    Each edge is (entity_a, entity_b, strength, strength_label, link_type) where
+    strength_label is Strong / Medium / Weak (relative to the strongest edge in
+    this result set) and link_type is direct (close spans in at least one chunk)
+    or indirect.
+    """
+    # (a,b) -> freq chunks, sum of proximity scores, source tags, best (min) gap seen
+    freq: dict[tuple[str, str], int] = defaultdict(int)
+    prox_sum: dict[tuple[str, str], float] = defaultdict(float)
+    sources: dict[tuple[str, str], set[str]] = defaultdict(set)
+    min_gap: dict[tuple[str, str], int] = defaultdict(lambda: 10**9)
+
+    for _text, hits, source_tag in chunks_with_entities:
+        pairs = _chunk_pair_min_gaps(hits)
+        if not pairs:
+            continue
+        tag = (source_tag or "").strip() or "unknown"
+        for (a, b), gap in pairs.items():
+            freq[(a, b)] += 1
+            prox_sum[(a, b)] += 1.0 / (1.0 + gap / 72.0)
+            sources[(a, b)].add(tag)
+            if gap < min_gap[(a, b)]:
+                min_gap[(a, b)] = gap
+
+    raw_scores: dict[tuple[str, str], float] = {}
+    for key in freq:
+        if freq[key] < min_weight:
+            continue
+        n_src = len(sources[key])
+        cross = 0.24 * max(0, n_src - 1)
+        avg_prox = prox_sum[key] / freq[key]
+        raw_scores[key] = freq[key] * (0.28 + 0.72 * avg_prox) + cross
+
+    if not raw_scores:
+        return []
+
+    max_raw = max(raw_scores.values())
+    if max_raw <= 0:
+        max_raw = 1.0
+
+    direct_gap_max = 110
+    edges: list[tuple[str, str, float, str, str]] = []
+    for (a, b), raw in raw_scores.items():
+        ratio = raw / max_raw
+        if ratio >= 0.56:
+            label = "Strong"
+        elif ratio >= 0.30:
+            label = "Medium"
+        else:
+            label = "Weak"
+        lt = "direct" if min_gap[(a, b)] <= direct_gap_max else "indirect"
+        edges.append((a, b, round(raw, 4), label, lt))
+
     edges.sort(key=lambda e: -e[2])
     return edges

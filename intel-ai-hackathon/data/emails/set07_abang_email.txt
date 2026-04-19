@@ -1,0 +1,7 @@
+From: intel.ops@example.com
+To: watchdesk@example.com
+Subject: Abang alias and company link
+Date: 2026-05-05 10:05:00 +0800
+
+Alias Abang may be linked to coordinator account under Test Company Best.
+Secondary driver vehicle ABC321A was observed at the same site.
