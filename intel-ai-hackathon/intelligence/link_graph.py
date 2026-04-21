@@ -171,6 +171,19 @@ def _find_person_node_case_insensitive(entity_nodes: set[str], person_candidate:
     return None
 
 
+def _normalize_entity_text(value: str) -> str:
+    return " ".join(value.strip().lower().split())
+
+
+def _canonicalize_entity_node(node_id: str, vehicle_texts: set[str]) -> str:
+    kind, sep, rest = node_id.partition(":")
+    if not sep:
+        return node_id
+    if _normalize_entity_text(rest) in vehicle_texts:
+        return f"vehicle:{rest.strip()}"
+    return f"{kind}:{rest.strip()}"
+
+
 def _pick_anchor_node(
     entity_nodes: set[str],
     reduced_edges: list[tuple[str, str, float, str, str]],
@@ -287,7 +300,21 @@ def build_entity_link_graph_figure(
         return None, ""
 
     try:
-        reduced_edges = sorted(edges, key=lambda e: -float(e[2]))[:GRAPH_TOP_EDGES]
+        vehicle_texts = {
+            _normalize_entity_text(n.split(":", 1)[1])
+            for e in edges
+            for n in (e[0], e[1])
+            if n.lower().startswith("vehicle:")
+        }
+        canonical_edges: list[tuple[str, str, float, str, str]] = []
+        for a, b, strength, lbl, link_type in edges:
+            ca = _canonicalize_entity_node(a, vehicle_texts)
+            cb = _canonicalize_entity_node(b, vehicle_texts)
+            if ca == cb:
+                continue
+            canonical_edges.append((ca, cb, strength, lbl, link_type))
+        canonical_edges = _dedupe_edges_keep_max_strength(canonical_edges)
+        reduced_edges = sorted(canonical_edges, key=lambda e: -float(e[2]))[:GRAPH_TOP_EDGES]
         nodes: set[str] = {a for a, _, _, _, _ in reduced_edges} | {b for _, b, _, _, _ in reduced_edges}
         if not nodes:
             return None, GRAPH_FAIL_MSG
@@ -302,6 +329,24 @@ def build_entity_link_graph_figure(
             pos_arr = rng.uniform(-1.2, 1.2, size=(n, 2))
         pos_arr = np.nan_to_num(pos_arr, nan=0.0, posinf=0.0, neginf=0.0)
         pos = {node_list[i]: (float(pos_arr[i, 0]), float(pos_arr[i, 1])) for i in range(n)}
+        query_segment = _first_query_segment(query)
+        anchor = None
+        if query_segment:
+            ql = query_segment.strip().lower()
+            anchor = next(
+                (
+                    nid
+                    for nid in node_list
+                    if nid.lower().startswith("person:") and ql in nid.split(":", 1)[1].strip().lower()
+                ),
+                None,
+            )
+        if anchor is None:
+            anchor = _pick_anchor_node(set(node_list), reduced_edges, None)
+        pos = _recenter_positions(pos, anchor)
+        pos = _sanitize_and_scale_positions(pos)
+        label_map = {nid: _short_label(nid) for nid in node_list}
+        color_map = {nid: _marker_color(_node_kind(nid)) for nid in node_list}
 
         fig = go.Figure()
         edge_trace_count = 0
@@ -328,8 +373,13 @@ def build_entity_link_graph_figure(
                 x=[pos[nid][0] for nid in node_list],
                 y=[pos[nid][1] for nid in node_list],
                 mode="markers+text",
-                marker=dict(size=20, color="#2563eb", line=dict(width=1, color="#0f172a")),
-                text=node_list,
+                marker=dict(
+                    size=20,
+                    color=[color_map[nid] for nid in node_list],
+                    line=dict(width=1, color="#0f172a"),
+                    symbol=[_marker_symbol(_node_kind(nid)) for nid in node_list],
+                ),
+                text=[label_map[nid] for nid in node_list],
                 textposition="top center",
                 textfont=dict(size=11, color="#0f172a"),
                 hoverinfo="text",
@@ -345,8 +395,13 @@ def build_entity_link_graph_figure(
                     x=[pos[nid][0] for nid in node_list],
                     y=[pos[nid][1] for nid in node_list],
                     mode="markers+text",
-                    marker=dict(size=20, color="#2563eb", line=dict(width=1, color="#0f172a")),
-                    text=node_list,
+                    marker=dict(
+                        size=20,
+                        color=[color_map[nid] for nid in node_list],
+                        line=dict(width=1, color="#0f172a"),
+                        symbol=[_marker_symbol(_node_kind(nid)) for nid in node_list],
+                    ),
+                    text=[label_map[nid] for nid in node_list],
                     textposition="top center",
                     textfont=dict(size=11, color="#0f172a"),
                     hoverinfo="text",

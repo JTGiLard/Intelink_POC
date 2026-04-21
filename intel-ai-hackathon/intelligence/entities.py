@@ -31,6 +31,22 @@ _MAKE_MODEL = re.compile(
 )
 
 _PERSON_FULLNAME = re.compile(r"\b[A-Z][a-z]+\s+[A-Z][a-z]+\b")
+_VEHICLE_WORDS = {
+    "vehicle",
+    "car",
+    "van",
+    "lorry",
+    "truck",
+    "motorcycle",
+    "motorbike",
+    "honda",
+    "toyota",
+    "mercedes",
+    "bmw",
+    "audi",
+    "hyundai",
+    "kia",
+}
 
 
 @dataclass
@@ -141,10 +157,25 @@ def extract_persons_spacy(text: str) -> list[EntityHit]:
 def extract_all_entities(text: str) -> list[EntityHit]:
     combined = extract_entities_regex(text) + extract_persons_spacy(text)
     combined.sort(key=lambda h: (h.span_start, -len(h.text)))
+    vehicle_hits = [h for h in combined if h.label == "vehicle" and h.text.strip()]
+
+    def overlaps_vehicle_span(hit: EntityHit) -> bool:
+        for vh in vehicle_hits:
+            if not (hit.span_end <= vh.span_start or vh.span_end <= hit.span_start):
+                return True
+        return False
+
+    def looks_like_vehicle_phrase(value: str) -> bool:
+        words = {w.lower() for w in re.findall(r"[A-Za-z]+", value)}
+        return bool(words & _VEHICLE_WORDS)
+
     filtered: list[EntityHit] = []
     seen: set[tuple[str, str, int, int]] = set()
     for h in combined:
-        key = (h.label, h.text.strip().lower(), h.span_start, h.span_end)
+        text_norm = h.text.strip().lower()
+        if h.label == "person" and (overlaps_vehicle_span(h) or looks_like_vehicle_phrase(h.text)):
+            continue
+        key = (h.label, text_norm, h.span_start, h.span_end)
         if key in seen:
             continue
         seen.add(key)
