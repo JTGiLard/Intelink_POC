@@ -4,21 +4,26 @@ from __future__ import annotations
 
 import math
 import re
-from collections import defaultdict
+from collections import defaultdict, deque
 from typing import Any
 
 import numpy as np
 import plotly.graph_objects as go
 
-from intelligence.entities import extract_all_entities
 from intelligence.index_store import ChunkRecord
 
 
 GRAPH_TOP_EDGES = 12
 MAX_TOTAL_NODES = 16
 MAX_CASE_NODES = 4
+EDGE_LABEL_MAX = 4
+INNER_RING_R = 1.05
+OUTER_RING_R = 1.78
 
-SIMPLIFIED_CAPTION = "Showing simplified relationship graph for readability."
+SIMPLIFIED_CAPTION = (
+    "Radial layout (subject center, grouped by type). "
+    f"Relationship phrases on up to {EDGE_LABEL_MAX} strongest direct links only."
+)
 GRAPH_FAIL_MSG = "Graph could not be rendered from current extracted entities."
 
 
@@ -184,6 +189,111 @@ def _canonicalize_entity_node(node_id: str, vehicle_texts: set[str]) -> str:
     return f"{kind}:{rest.strip()}"
 
 
+def _relationship_edge_label(node_a: str, node_b: str) -> str:
+    kinds = {_node_kind(node_a), _node_kind(node_b)}
+    if kinds == {"person", "phone"}:
+        return "uses phone"
+    if kinds == {"person", "vehicle"}:
+        return "drives vehicle"
+    if kinds == {"person"}:
+        return "associated with"
+    if "person" in kinds and kinds <= {"person", "pseudo", "vehicle", "phone"}:
+        return "linked to"
+    return "linked to"
+
+
+def _type_group_rank(kind: str) -> int:
+    order = ("person", "pseudo", "vehicle", "phone", "case", "source", "other")
+    try:
+        return order.index(kind)
+    except ValueError:
+        return len(order)
+
+
+def _bfs_distance_from(anchor: str, adj: dict[str, set[str]], nodes: set[str]) -> dict[str, int]:
+    if anchor not in nodes:
+        return {n: 99 for n in nodes}
+    dist: dict[str, int] = {anchor: 0}
+    q: deque[str] = deque([anchor])
+    while q:
+        u = q.popleft()
+        for v in adj[u]:
+            if v not in nodes or v in dist:
+                continue
+            dist[v] = dist[u] + 1
+            q.append(v)
+    return {n: dist.get(n, 99) for n in nodes}
+
+
+def _circular_mean_angle(radians_list: list[float]) -> float:
+    if not radians_list:
+        return 0.0
+    s = sum(math.sin(t) for t in radians_list)
+    c = sum(math.cos(t) for t in radians_list)
+    return math.atan2(s, c) if (s != 0.0 or c != 0.0) else 0.0
+
+
+def _angle_of(xy: tuple[float, float]) -> float:
+    return math.atan2(xy[1], xy[0])
+
+
+def _radial_grouped_ring_layout(
+    node_list: list[str],
+    reduced_edges: list[tuple[str, str, float, str, str]],
+    anchor: str,
+) -> dict[str, tuple[float, float]]:
+    """Deterministic radial layout: anchor center, grouped inner ring, farther hops on outer rings."""
+    nodes = set(node_list)
+    if anchor not in nodes:
+        anchor = sorted(nodes)[0]
+    adj: dict[str, set[str]] = defaultdict(set)
+    for a, b, *_rest in reduced_edges:
+        if a in nodes and b in nodes:
+            adj[a].add(b)
+            adj[b].add(a)
+
+    pos: dict[str, tuple[float, float]] = {anchor: (0.0, 0.0)}
+    direct = sorted(n for n in adj[anchor] if n in nodes and n != anchor)
+    groups: dict[str, list[str]] = defaultdict(list)
+    for nid in direct:
+        groups[_node_kind(nid)].append(nid)
+    for k in groups:
+        groups[k].sort()
+
+    nonempty_kinds = sorted([k for k, v in groups.items() if v], key=_type_group_rank)
+    n_sectors = max(1, len(nonempty_kinds))
+    sector = (2.0 * math.pi) / float(n_sectors)
+    for si, kind in enumerate(nonempty_kinds):
+        members = groups[kind]
+        m = len(members)
+        base = si * sector
+        for j, nid in enumerate(members):
+            t = base + (j + 1.0) * (sector / float(m + 1))
+            pos[nid] = (INNER_RING_R * math.cos(t), INNER_RING_R * math.sin(t))
+
+    dist = _bfs_distance_from(anchor, adj, nodes)
+    farther = sorted([n for n in nodes if n not in pos], key=lambda x: (dist.get(x, 99), x))
+    ring_dr = 0.58
+
+    for idx, nid in enumerate(farther):
+        d_raw = dist.get(nid, 99)
+        nbr_angles = [_angle_of(pos[nb]) for nb in adj[nid] if nb in pos]
+        if nbr_angles:
+            theta = _circular_mean_angle(nbr_angles)
+        else:
+            theta = 2.0 * math.pi * ((hash(nid) % 10007) / 10007.0)
+        jitter = ((idx % 11) - 5) * 0.085
+        theta2 = theta + jitter
+        if d_raw >= 99:
+            r = OUTER_RING_R + ring_dr * 2.4
+        else:
+            d_use = min(d_raw, 6)
+            r = OUTER_RING_R + ring_dr * max(0, d_use - 2)
+        pos[nid] = (r * math.cos(theta2), r * math.sin(theta2))
+
+    return pos
+
+
 def _pick_anchor_node(
     entity_nodes: set[str],
     reduced_edges: list[tuple[str, str, float, str, str]],
@@ -240,61 +350,12 @@ def _sanitize_and_scale_positions(
     return scaled
 
 
-def _fr_layout(
-    node_list: list[str],
-    weighted_pairs: list[tuple[str, str, float]],
-    seed: int = 42,
-    iterations: int = 56,
-) -> dict[str, tuple[float, float]]:
-    n = len(node_list)
-    if n == 0:
-        return {}
-    if n == 1:
-        return {node_list[0]: (0.0, 0.0)}
-    rng = np.random.default_rng(seed)
-    idx = {nid: i for i, nid in enumerate(node_list)}
-    pos = rng.uniform(-0.55, 0.55, (n, 2))
-    k = 1.0 / math.sqrt(float(n))
-    t = 0.75
-    for _ in range(iterations):
-        disp = np.zeros((n, 2))
-        for i in range(n):
-            for j in range(i + 1, n):
-                delta = pos[i] - pos[j]
-                dist2 = float(np.dot(delta, delta)) + 1e-6
-                force = (k * k / dist2) * delta
-                disp[i] += force
-                disp[j] -= force
-        for u, v, w in weighted_pairs:
-            if u not in idx or v not in idx:
-                continue
-            i, j = idx[u], idx[v]
-            delta = pos[j] - pos[i]
-            dist = math.sqrt(float(np.dot(delta, delta)) + 1e-9)
-            attractive = (dist * dist / k) * (0.07 + 0.11 * min(float(w), 6.0)) * (delta / dist)
-            disp[i] += attractive
-            disp[j] -= attractive
-        pos += t * disp
-        t *= 0.965
-    pos -= pos.mean(axis=0)
-    mx = float(np.max(np.abs(pos)) + 1e-9)
-    pos /= mx
-    pos = np.nan_to_num(pos, nan=0.0, posinf=0.0, neginf=0.0)
-    return {node_list[i]: (float(pos[i, 0]), float(pos[i, 1])) for i in range(n)}
-
-
-def _merge_edge_weights(pairs: list[tuple[str, str, float]]) -> list[tuple[str, str, float]]:
-    merged: dict[tuple[str, str], float] = {}
-    for u, v, w in pairs:
-        a, b = (u, v) if u < v else (v, u)
-        merged[(a, b)] = max(merged.get((a, b), 0.0), float(w))
-    return [(a, b, w) for (a, b), w in merged.items()]
-
-
 def build_entity_link_graph_figure(
     ranked: list[tuple[ChunkRecord, float]],
     edges: list[tuple[str, str, float, str, str]],
     query: str = "",
+    person_centric: bool = False,
+    anchor_person: str = "",
 ) -> tuple[go.Figure | None, str]:
     if not edges:
         return None, ""
@@ -320,33 +381,23 @@ def build_entity_link_graph_figure(
             return None, GRAPH_FAIL_MSG
 
         node_list = sorted(nodes)
-        n = len(node_list)
-        if n <= 12:
-            angles = np.linspace(0.0, 2.0 * np.pi, n, endpoint=False)
-            pos_arr = np.column_stack((np.cos(angles), np.sin(angles)))
-        else:
-            rng = np.random.default_rng(42)
-            pos_arr = rng.uniform(-1.2, 1.2, size=(n, 2))
-        pos_arr = np.nan_to_num(pos_arr, nan=0.0, posinf=0.0, neginf=0.0)
-        pos = {node_list[i]: (float(pos_arr[i, 0]), float(pos_arr[i, 1])) for i in range(n)}
-        query_segment = _first_query_segment(query)
-        anchor = None
-        if query_segment:
-            ql = query_segment.strip().lower()
-            anchor = next(
-                (
-                    nid
-                    for nid in node_list
-                    if nid.lower().startswith("person:") and ql in nid.split(":", 1)[1].strip().lower()
-                ),
-                None,
-            )
-        if anchor is None:
-            anchor = _pick_anchor_node(set(node_list), reduced_edges, None)
-        pos = _recenter_positions(pos, anchor)
+        anchor_id: str | None = None
+        if person_centric:
+            preferred_name = anchor_person.strip() or _first_query_segment(query)
+            if preferred_name:
+                anchor_id = _find_person_node_case_insensitive(set(node_list), preferred_name)
+        if anchor_id is None:
+            anchor_id = _pick_anchor_node(set(node_list), reduced_edges, None)
+        if anchor_id is None or anchor_id not in node_list:
+            anchor_id = node_list[0]
+
+        pos = _radial_grouped_ring_layout(node_list, reduced_edges, anchor_id)
+        pos = _recenter_positions(pos, anchor_id)
         pos = _sanitize_and_scale_positions(pos)
         label_map = {nid: _short_label(nid) for nid in node_list}
         color_map = {nid: _marker_color(_node_kind(nid)) for nid in node_list}
+
+        max_strength = max((float(e[2]) for e in reduced_edges), default=1.0)
 
         fig = go.Figure()
         edge_trace_count = 0
@@ -356,7 +407,8 @@ def build_entity_link_graph_figure(
             x0, y0 = pos[a]
             x1, y1 = pos[b]
             dash = "solid" if link_type == "direct" else "dash"
-            width = max(2.0, float(strength) * 2.0)
+            norm = float(strength) / max_strength if max_strength > 0 else 0.0
+            width = 2.0 + norm * 6.5
             fig.add_trace(
                 go.Scatter(
                     x=[x0, x1],
@@ -409,6 +461,38 @@ def build_entity_link_graph_figure(
                 )
             )
 
+        label_edges = [e for e in reduced_edges if e[4] == "direct"]
+        label_edges.sort(key=lambda e: -float(e[2]))
+        ann: list[dict[str, Any]] = []
+        for a, b, _strength, _lbl, _lt in label_edges[:EDGE_LABEL_MAX]:
+            if a not in pos or b not in pos:
+                continue
+            x0, y0 = pos[a]
+            x1, y1 = pos[b]
+            mx, my = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+            dx, dy = x1 - x0, y1 - y0
+            ln = math.hypot(dx, dy) or 1.0
+            nx, ny = -dy / ln, dx / ln
+            off = 0.09
+            ox, oy = mx + nx * off, my + ny * off
+            textangle = math.degrees(math.atan2(dy, dx))
+            if textangle > 90:
+                textangle -= 180.0
+            if textangle < -90:
+                textangle += 180.0
+            ann.append(
+                {
+                    "xref": "x",
+                    "yref": "y",
+                    "x": ox,
+                    "y": oy,
+                    "text": _relationship_edge_label(a, b),
+                    "showarrow": False,
+                    "font": {"size": 10, "color": "#334155"},
+                    "textangle": textangle,
+                }
+            )
+
         fig.update_layout(
             title=dict(text="Relationship graph (current retrieval only)", font=dict(size=14, color="#0f172a")),
             xaxis=dict(range=[-2, 2], visible=False),
@@ -418,6 +502,7 @@ def build_entity_link_graph_figure(
             paper_bgcolor="#f8fafc",
             margin=dict(l=20, r=20, t=48, b=20),
             height=520,
+            annotations=ann,
         )
         return fig, SIMPLIFIED_CAPTION
     except Exception:

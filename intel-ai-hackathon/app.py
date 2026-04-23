@@ -272,9 +272,38 @@ def find_alias_suggestion(query: str, summary: EntitySummary) -> str | None:
 
     best_name, best_freq = max(alias_candidates, key=lambda item: score(item[0], item[1]))
     sim = SequenceMatcher(None, token, best_name.lower()).ratio()
-    if sim < 0.68 and best_freq < 2:
+    # Short tokens are easy to confuse with unrelated names (e.g. Tay vs Tan); require stronger evidence.
+    min_sim = 0.88 if len(token) <= 4 else 0.68
+    if sim < min_sim and best_freq < 2:
+        return None
+    if len(token) <= 4 and best_name.lower() != token and sim < 0.92:
         return None
     return best_name
+
+
+def _person_name_parts(name: str) -> list[str]:
+    return [p.strip().lower() for p in re.split(r"\s+", name.strip()) if p.strip()]
+
+
+def corpus_distinct_person_names_with_token(records: list[ChunkRecord], token: str) -> frozenset[str]:
+    """Distinct extracted person strings where ``token`` matches a whole name part (case-insensitive)."""
+    tk = token.strip().lower()
+    if not tk:
+        return frozenset()
+    seen_lower: dict[str, str] = {}
+    for r in records:
+        for h in extract_all_entities(r.text):
+            if h.label != "person":
+                continue
+            raw = h.text.strip()
+            if not raw:
+                continue
+            if tk not in _person_name_parts(raw):
+                continue
+            k = " ".join(raw.lower().split())
+            if k not in seen_lower:
+                seen_lower[k] = raw
+    return frozenset(seen_lower.values())
 
 
 def _source_mix_sentence(ranked: list[tuple[ChunkRecord, float]]) -> str:
@@ -349,12 +378,6 @@ def build_ai_summary(
     if _is_single_token_person_like_query(query):
         q = _person_phrase_from_query(query).strip()
         if q and not _has_exact_person_token_match(summary, q):
-            surname_suggestion = find_surname_token_suggestion(query, summary)
-            if surname_suggestion:
-                return (
-                    f"No exact match was found for '{q}'. Did you mean '{surname_suggestion}'? "
-                    "Showing semantically related evidence only."
-                )
             alias_suggestion = find_alias_suggestion(query, summary)
             if alias_suggestion:
                 return (
@@ -456,10 +479,61 @@ def main() -> None:
         st.info("Enter a query and press **Search**.")
         return
 
+    query_token = _person_phrase_from_query(query).strip()
+    broad_single_token = (
+        _is_single_token_person_like_query(query)
+        and len(query_token) >= 3
+        and not _is_person_like_two_word_query(query)
+    )
+    distinct_person_hits: frozenset[str] = frozenset()
+    if broad_single_token:
+        distinct_person_hits = corpus_distinct_person_names_with_token(store.records, query_token)
+
+    if broad_single_token and len(distinct_person_hits) >= 2:
+        st.warning(
+            f"'{query_token}' appears in multiple records and may refer to different people or aliases. "
+            "Refine the search with a full name, vehicle, phone number, or alias for more accurate results."
+        )
+        choice = st.radio(
+            "How would you like to proceed?",
+            (
+                "Refine search",
+                f"Show broad {query_token} results anyway",
+            ),
+            key=f"broad_token_gate:{query_token.lower()}",
+            horizontal=True,
+        )
+        if choice == "Refine search":
+            st.caption("Try a full name, vehicle plate, phone number, or a distinctive alias.")
+            return
+    elif broad_single_token and len(distinct_person_hits) == 0:
+        st.warning(
+            f"No exact occurrences were found for '{query_token}' in extracted person or name tokens. "
+            "Please refine or amend your search."
+        )
+        choice = st.radio(
+            "How would you like to proceed?",
+            (
+                "Refine search",
+                "Show semantic matches anyway",
+            ),
+            key=f"broad_token_empty:{query_token.lower()}",
+            horizontal=True,
+        )
+        if choice == "Refine search":
+            st.caption("Try a spelling variant, full name, vehicle plate, phone number, or different keyword.")
+            return
+
     qv = embed_texts([query])
     raw_hits = store.search(qv[0], k=top_k)
-    ranked = hybrid_rank(raw_hits, query, keyword_boost=keyword_boost)
-    summary, edges, timeline = aggregate_dashboard(ranked, query)
+    ranked_semantic = hybrid_rank(raw_hits, query, keyword_boost=keyword_boost)
+    summary_semantic, edges_semantic, timeline_semantic = aggregate_dashboard(ranked_semantic, query)
+
+    ranked = ranked_semantic
+    summary = summary_semantic
+    edges = edges_semantic
+    timeline = timeline_semantic
+
     st.subheader("AI Summary")
     st.write(build_ai_summary(ranked, summary, timeline, query))
     q_tokens = [t for t in query.strip().lower().split() if len(t) > 1]
@@ -513,7 +587,15 @@ def main() -> None:
         if not edges:
             st.write("No edges found for this result set.")
         else:
-            gfig, gnote = build_entity_link_graph_figure(ranked, edges, query)
+            use_person_centric = _is_person_like_two_word_query(query) and has_exact_full_name_hit(ranked, query)
+            anchor_person = _person_phrase_from_query(query) if use_person_centric else ""
+            gfig, gnote = build_entity_link_graph_figure(
+                ranked,
+                edges,
+                query,
+                person_centric=use_person_centric,
+                anchor_person=anchor_person,
+            )
             if gfig is not None:
                 st.plotly_chart(gfig, use_container_width=True)
                 if gnote:
