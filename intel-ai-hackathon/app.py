@@ -75,7 +75,7 @@ def build_or_load_index(data_root: Path, use_cache: bool) -> FaissIndexStore:
     docs = list(iter_documents(data_root))
     if not docs:
         raise FileNotFoundError(
-            f"No documents under {data_root}. Add .txt/.md to data/reports, data/emails, or data/whatsapp."
+            f"No documents under {data_root}. Add .txt/.md/.docx to data/reports, data/emails, or data/whatsapp."
         )
     chunks = []
     for d in docs:
@@ -456,7 +456,8 @@ def main() -> None:
             st.exception(e)
             st.stop()
 
-    st.sidebar.success(f"Indexed **{len(store.records)}** chunks.")
+    source_files = len({r.source_file for r in store.records})
+    st.sidebar.success(f"Indexed **{len(store.records)}** chunks from **{source_files}** source files.")
     if st.sidebar.button("Clear active search"):
         st.session_state.pop("active_query", None)
         if "qbox" in st.session_state:
@@ -552,7 +553,7 @@ def main() -> None:
         for r, score in ranked:
             with st.expander(f"[{r.source_type}] {r.doc_title} — score {score:.3f}"):
                 st.markdown(highlight_query(r.text[:6000], query))
-                st.caption(f"`{r.chunk_id}`")
+                st.caption(f"`{r.source_file}` · `{r.chunk_id}`")
 
     with ent_tab:
         c1, c2, c3 = st.columns(3)

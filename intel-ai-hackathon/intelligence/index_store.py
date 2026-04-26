@@ -18,6 +18,7 @@ class ChunkRecord:
     doc_id: str
     source_type: str
     doc_title: str
+    source_file: str
     text: str
     char_start: int
     doc_occurred_at: str | None
@@ -30,6 +31,7 @@ class ChunkRecord:
             doc_id=c.doc_id,
             source_type=c.source_type,
             doc_title=c.doc_title,
+            source_file=c.source_file,
             text=c.text,
             char_start=c.char_start,
             doc_occurred_at=ts,

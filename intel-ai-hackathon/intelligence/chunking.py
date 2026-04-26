@@ -13,6 +13,7 @@ class TextChunk:
     doc_id: str
     source_type: str
     doc_title: str
+    source_file: str
     text: str
     char_start: int
     doc_occurred_at: datetime | None
@@ -45,6 +46,7 @@ def chunk_document(
                 doc_id=doc.doc_id,
                 source_type=doc.source_type,
                 doc_title=doc.title,
+                source_file=doc.source_file,
                 text=body,
                 char_start=start,
                 doc_occurred_at=doc.occurred_at,

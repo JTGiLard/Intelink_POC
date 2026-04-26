@@ -7,12 +7,15 @@ from datetime import datetime
 from pathlib import Path
 from typing import Iterator
 
+from docx import Document
+
 
 @dataclass
 class LoadedDocument:
     doc_id: str
     source_type: str  # report | email | whatsapp
     title: str
+    source_file: str
     text: str
     occurred_at: datetime | None
 
@@ -53,6 +56,7 @@ def load_whatsapp(path: Path) -> LoadedDocument:
         doc_id=f"whatsapp:{path.name}",
         source_type="whatsapp",
         title=title,
+        source_file=path.name,
         text=text,
         occurred_at=first_dt,
     )
@@ -97,18 +101,24 @@ def load_email(path: Path) -> LoadedDocument:
         doc_id=f"email:{path.name}",
         source_type="email",
         title=title,
+        source_file=path.name,
         text=text,
         occurred_at=occurred_at,
     )
 
 
 def load_report(path: Path) -> LoadedDocument:
-    text = path.read_text(encoding="utf-8", errors="replace")
+    if path.suffix.lower() == ".docx":
+        doc = Document(path)
+        text = "\n\n".join(p.text.strip() for p in doc.paragraphs if p.text.strip())
+    else:
+        text = path.read_text(encoding="utf-8", errors="replace")
     mtime = datetime.fromtimestamp(path.stat().st_mtime)
     return LoadedDocument(
         doc_id=f"report:{path.name}",
         source_type="report",
-        title=path.stem,
+        title=path.name,
+        source_file=path.name,
         text=text,
         occurred_at=mtime,
     )
@@ -123,12 +133,12 @@ def load_document(path: Path) -> LoadedDocument | None:
     if parent == "emails" or parent == "email" or suffix == ".eml":
         if suffix in {".eml", ".txt", ".msg"}:
             return load_email(path)
-    if parent == "reports" or suffix in {".txt", ".md", ".rst"}:
-        if suffix in {".txt", ".md", ".rst"}:
+    if parent == "reports" or suffix in {".txt", ".md", ".rst", ".docx"}:
+        if suffix in {".txt", ".md", ".rst", ".docx"}:
             return load_report(path)
     if suffix == ".eml":
         return load_email(path)
-    if suffix in {".txt", ".md"}:
+    if suffix in {".txt", ".md", ".docx"}:
         if "whatsapp" in str(path).lower():
             return load_whatsapp(path)
         return load_report(path)
