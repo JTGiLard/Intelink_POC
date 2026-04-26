@@ -13,10 +13,10 @@ import plotly.graph_objects as go
 from intelligence.index_store import ChunkRecord
 
 
-GRAPH_TOP_EDGES = 12
+GRAPH_TOP_EDGES = 14
 MAX_TOTAL_NODES = 16
 MAX_CASE_NODES = 4
-EDGE_LABEL_MAX = 4
+EDGE_LABEL_MAX = 6
 INNER_RING_R = 1.05
 OUTER_RING_R = 1.78
 
@@ -64,6 +64,36 @@ def _short_label(node_id: str) -> str:
     if len(rest) > 14:
         return rest[:12] + "…"
     return rest
+
+
+def _vehicle_display_label(node_id: str, plate_to_model: dict[str, str]) -> str:
+    """Render vehicle nodes as plate-first labels with optional model on second line."""
+    if not node_id.lower().startswith("vehicle:"):
+        return _short_label(node_id)
+    value = node_id.split(":", 1)[1].strip()
+    model = plate_to_model.get(value, "").strip()
+    if model:
+        return f"{value}\n{model}"
+    return value
+
+
+def _looks_like_plate_token(raw: str) -> bool:
+    t = raw.strip().upper().replace(" ", "")
+    if len(t) < 5:
+        return False
+    return bool(re.search(r"[A-Z]+\d+[A-Z]*", t))
+
+
+def _looks_like_vehicle_model(raw: str) -> bool:
+    t = raw.strip()
+    if len(t) < 4:
+        return False
+    words = [w for w in t.split() if w]
+    if len(words) < 2:
+        return False
+    if any(any(ch.isdigit() for ch in w) for w in words):
+        return False
+    return all(w[:1].isalpha() for w in words)
 
 
 def _marker_symbol(kind: str) -> str:
@@ -202,6 +232,43 @@ def _relationship_edge_label(node_a: str, node_b: str) -> str:
     return "linked to"
 
 
+def _collapse_vehicle_model_nodes(
+    edges: list[tuple[str, str, float, str, str]],
+) -> tuple[list[tuple[str, str, float, str, str]], dict[str, str], set[str]]:
+    """Attach models to plate nodes and remove duplicate model nodes where possible."""
+    model_to_plate_best: dict[str, tuple[str, float]] = {}
+    for a, b, strength, _lbl, link_type in edges:
+        if not (a.startswith("vehicle:") and b.startswith("vehicle:")):
+            continue
+        av = a.split(":", 1)[1].strip()
+        bv = b.split(":", 1)[1].strip()
+        a_plate, b_plate = _looks_like_plate_token(av), _looks_like_plate_token(bv)
+        a_model, b_model = _looks_like_vehicle_model(av), _looks_like_vehicle_model(bv)
+        if a_plate and b_model and (link_type == "direct" or strength >= 0.6):
+            prev = model_to_plate_best.get(bv)
+            if prev is None or strength > prev[1]:
+                model_to_plate_best[bv] = (av, strength)
+        elif b_plate and a_model and (link_type == "direct" or strength >= 0.6):
+            prev = model_to_plate_best.get(av)
+            if prev is None or strength > prev[1]:
+                model_to_plate_best[av] = (bv, strength)
+
+    plate_to_model: dict[str, str] = {}
+    for model, (plate, _s) in sorted(model_to_plate_best.items(), key=lambda x: -x[1][1]):
+        if plate not in plate_to_model:
+            plate_to_model[plate] = model
+
+    suppressed_models = set(model_to_plate_best.keys())
+    remapped: list[tuple[str, str, float, str, str]] = []
+    for a, b, strength, lbl, link_type in edges:
+        ra = f"vehicle:{model_to_plate_best[a.split(':', 1)[1].strip()][0]}" if a.startswith("vehicle:") and a.split(":", 1)[1].strip() in suppressed_models else a
+        rb = f"vehicle:{model_to_plate_best[b.split(':', 1)[1].strip()][0]}" if b.startswith("vehicle:") and b.split(":", 1)[1].strip() in suppressed_models else b
+        if ra == rb:
+            continue
+        remapped.append((ra, rb, strength, lbl, link_type))
+    return remapped, plate_to_model, suppressed_models
+
+
 def _type_group_rank(kind: str) -> int:
     order = ("person", "pseudo", "vehicle", "phone", "case", "source", "other")
     try:
@@ -267,7 +334,14 @@ def _radial_grouped_ring_layout(
         members = groups[kind]
         m = len(members)
         base = si * sector
-        for j, nid in enumerate(members):
+        members_ranked = sorted(
+            members,
+            key=lambda nid: (
+                -sum(e[2] for e in reduced_edges if (e[0] == anchor and e[1] == nid) or (e[1] == anchor and e[0] == nid)),
+                nid,
+            ),
+        )
+        for j, nid in enumerate(members_ranked):
             t = base + (j + 1.0) * (sector / float(m + 1))
             pos[nid] = (INNER_RING_R * math.cos(t), INNER_RING_R * math.sin(t))
 
@@ -374,6 +448,7 @@ def build_entity_link_graph_figure(
             if ca == cb:
                 continue
             canonical_edges.append((ca, cb, strength, lbl, link_type))
+        canonical_edges, plate_to_model, _suppressed_models = _collapse_vehicle_model_nodes(canonical_edges)
         canonical_edges = _dedupe_edges_keep_max_strength(canonical_edges)
         reduced_edges = sorted(canonical_edges, key=lambda e: -float(e[2]))[:GRAPH_TOP_EDGES]
         nodes: set[str] = {a for a, _, _, _, _ in reduced_edges} | {b for _, b, _, _, _ in reduced_edges}
@@ -394,7 +469,7 @@ def build_entity_link_graph_figure(
         pos = _radial_grouped_ring_layout(node_list, reduced_edges, anchor_id)
         pos = _recenter_positions(pos, anchor_id)
         pos = _sanitize_and_scale_positions(pos)
-        label_map = {nid: _short_label(nid) for nid in node_list}
+        label_map = {nid: _vehicle_display_label(nid, plate_to_model) for nid in node_list}
         color_map = {nid: _marker_color(_node_kind(nid)) for nid in node_list}
 
         max_strength = max((float(e[2]) for e in reduced_edges), default=1.0)
@@ -420,10 +495,22 @@ def build_entity_link_graph_figure(
             )
             edge_trace_count += 1
 
+        node_x = [pos[nid][0] for nid in node_list]
+        node_y = [pos[nid][1] for nid in node_list]
+        text_positions: list[str] = []
+        for nid in node_list:
+            if nid == anchor_id:
+                text_positions.append("top center")
+                continue
+            x, y = pos[nid]
+            if abs(x) > abs(y):
+                text_positions.append("middle right" if x >= 0 else "middle left")
+            else:
+                text_positions.append("top center" if y >= 0 else "bottom center")
         fig.add_trace(
             go.Scatter(
-                x=[pos[nid][0] for nid in node_list],
-                y=[pos[nid][1] for nid in node_list],
+                x=node_x,
+                y=node_y,
                 mode="markers+text",
                 marker=dict(
                     size=20,
@@ -432,8 +519,8 @@ def build_entity_link_graph_figure(
                     symbol=[_marker_symbol(_node_kind(nid)) for nid in node_list],
                 ),
                 text=[label_map[nid] for nid in node_list],
-                textposition="top center",
-                textfont=dict(size=11, color="#0f172a"),
+                textposition=text_positions,
+                textfont=dict(size=10, color="#0f172a"),
                 hoverinfo="text",
                 hovertext=node_list,
             )
@@ -493,11 +580,64 @@ def build_entity_link_graph_figure(
                 }
             )
 
+        fig.add_trace(
+            go.Scatter(
+                x=[None],
+                y=[None],
+                mode="markers",
+                marker=dict(size=11, color="#2563eb", symbol="circle", line=dict(width=1, color="#0f172a")),
+                name="Person",
+                showlegend=True,
+                hoverinfo="skip",
+            )
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=[None],
+                y=[None],
+                mode="markers",
+                marker=dict(size=11, color="#059669", symbol="square", line=dict(width=1, color="#0f172a")),
+                name="Vehicle (plate)",
+                showlegend=True,
+                hoverinfo="skip",
+            )
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=[None],
+                y=[None],
+                mode="markers",
+                marker=dict(size=11, color="#d97706", symbol="diamond", line=dict(width=1, color="#0f172a")),
+                name="Phone",
+                showlegend=True,
+                hoverinfo="skip",
+            )
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=[None, None],
+                y=[None, None],
+                mode="lines",
+                line=dict(color="#0f172a", width=5),
+                name="Thicker line = stronger relationship",
+                showlegend=True,
+                hoverinfo="skip",
+            )
+        )
+
         fig.update_layout(
             title=dict(text="Relationship graph (current retrieval only)", font=dict(size=14, color="#0f172a")),
             xaxis=dict(range=[-2, 2], visible=False),
             yaxis=dict(range=[-2, 2], visible=False),
-            showlegend=False,
+            showlegend=True,
+            legend=dict(
+                orientation="h",
+                yanchor="top",
+                y=1.02,
+                xanchor="left",
+                x=0.0,
+                bgcolor="rgba(248,250,252,0.92)",
+            ),
             plot_bgcolor="#ffffff",
             paper_bgcolor="#f8fafc",
             margin=dict(l=20, r=20, t=48, b=20),
