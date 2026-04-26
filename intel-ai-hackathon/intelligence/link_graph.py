@@ -10,6 +10,7 @@ from typing import Any
 import numpy as np
 import plotly.graph_objects as go
 
+from intelligence.entities import normalize_phone_number
 from intelligence.index_store import ChunkRecord
 
 
@@ -214,6 +215,8 @@ def _canonicalize_entity_node(node_id: str, vehicle_texts: set[str]) -> str:
     kind, sep, rest = node_id.partition(":")
     if not sep:
         return node_id
+    if kind == "phone":
+        return f"phone:{normalize_phone_number(rest) or rest.strip()}"
     if _normalize_entity_text(rest) in vehicle_texts:
         return f"vehicle:{rest.strip()}"
     return f"{kind}:{rest.strip()}"
@@ -223,6 +226,8 @@ def _relationship_edge_label(node_a: str, node_b: str) -> str:
     kinds = {_node_kind(node_a), _node_kind(node_b)}
     if kinds == {"person", "phone"}:
         return "uses phone"
+    if kinds == {"phone", "vehicle"}:
+        return "associated with"
     if kinds == {"person", "vehicle"}:
         return "drives vehicle"
     if kinds == {"person"}:
@@ -491,6 +496,7 @@ def build_entity_link_graph_figure(
                     mode="lines",
                     line=dict(color="#0f172a", width=width, dash=dash),
                     hoverinfo="skip",
+                    showlegend=False,
                 )
             )
             edge_trace_count += 1
@@ -523,6 +529,7 @@ def build_entity_link_graph_figure(
                 textfont=dict(size=10, color="#0f172a"),
                 hoverinfo="text",
                 hovertext=node_list,
+                showlegend=False,
             )
         )
 
@@ -545,6 +552,7 @@ def build_entity_link_graph_figure(
                     textfont=dict(size=11, color="#0f172a"),
                     hoverinfo="text",
                     hovertext=node_list,
+                    showlegend=False,
                 )
             )
 
@@ -620,6 +628,28 @@ def build_entity_link_graph_figure(
                 mode="lines",
                 line=dict(color="#0f172a", width=5),
                 name="Thicker line = stronger relationship",
+                showlegend=True,
+                hoverinfo="skip",
+            )
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=[None, None],
+                y=[None, None],
+                mode="lines",
+                line=dict(color="#0f172a", width=3.5, dash="solid"),
+                name="Solid line = direct relationship",
+                showlegend=True,
+                hoverinfo="skip",
+            )
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=[None, None],
+                y=[None, None],
+                mode="lines",
+                line=dict(color="#0f172a", width=3.5, dash="dash"),
+                name="Dashed line = indirect relationship",
                 showlegend=True,
                 hoverinfo="skip",
             )

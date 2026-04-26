@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 from collections import Counter
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -17,6 +18,7 @@ from intelligence.entities import (
     EntitySummary,
     cooccurrence_edges,
     extract_all_entities,
+    normalize_phone_number,
     summarize_entities,
 )
 from intelligence.index_store import (
@@ -160,6 +162,47 @@ def has_exact_full_name_hit(ranked: list[tuple[ChunkRecord, float]], query: str)
     return any(phrase in r.text.lower() for r, _ in ranked)
 
 
+def corpus_has_exact_phrase(records: list[ChunkRecord], phrase: str) -> bool:
+    q = " ".join(phrase.strip().lower().split())
+    if not q:
+        return False
+    return any(q in r.text.lower() for r in records)
+
+
+def _vehicle_query_normalized(query: str) -> str:
+    return re.sub(r"\s+", "", query.strip().upper())
+
+
+def _is_vehicle_or_plate_query(query: str) -> bool:
+    q = _vehicle_query_normalized(query)
+    return bool(re.fullmatch(r"[A-Z]{1,3}\d{1,4}[A-Z]?", q))
+
+
+def _classify_evidence(
+    ranked: list[tuple[ChunkRecord, float]],
+    query: str,
+) -> tuple[list[tuple[ChunkRecord, float]], list[tuple[ChunkRecord, float]]]:
+    person_phrase = _person_phrase_from_query(query).strip()
+    person_two_word = _is_person_like_two_word_query(query)
+    phone_norm = normalize_phone_number(query)
+    vehicle_norm = _vehicle_query_normalized(query)
+
+    primary: list[tuple[ChunkRecord, float]] = []
+    related: list[tuple[ChunkRecord, float]] = []
+    for r, score in ranked:
+        text_l = r.text.lower()
+        if person_two_word and person_phrase:
+            is_primary = person_phrase.lower() in text_l
+        elif phone_norm:
+            is_primary = normalize_phone_number(r.text) == phone_norm or (phone_norm in re.sub(r"\D", "", r.text))
+        elif _is_vehicle_or_plate_query(query):
+            is_primary = vehicle_norm in _vehicle_query_normalized(r.text)
+        else:
+            is_primary = query.strip().lower() in text_l
+        (primary if is_primary else related).append((r, score))
+    return primary, related
+
+
 def aggregate_dashboard(
     ranked: list[tuple[ChunkRecord, float]],
     query: str,
@@ -223,14 +266,30 @@ def find_closest_person_match(query: str, summary: EntitySummary) -> str | None:
         return None
     ql = q.lower()
 
-    def rank(name: str, freq: int) -> tuple[float, int]:
-        # Favor name frequency first, with light string-similarity tie-breaking.
-        sim = SequenceMatcher(None, ql, name.lower()).ratio()
-        return (freq + sim * 1.5, freq)
+    q_parts = _person_name_parts(q)
+    if len(q_parts) < 2:
+        return None
+
+    def rank(name: str, freq: int) -> tuple[float, float, int]:
+        parts = _person_name_parts(name)
+        if len(parts) < 2:
+            return (-1.0, -1.0, freq)
+        first_sim = SequenceMatcher(None, q_parts[0], parts[0]).ratio()
+        last_sim = SequenceMatcher(None, q_parts[-1], parts[-1]).ratio()
+        token_overlap = len(set(q_parts) & set(parts))
+        # Require both parts reasonably similar OR one exact token with strong support.
+        if not ((first_sim >= 0.72 and last_sim >= 0.72) or (token_overlap >= 1 and freq >= 3 and (first_sim + last_sim) >= 1.45)):
+            return (-1.0, -1.0, freq)
+        full_sim = SequenceMatcher(None, ql, name.lower()).ratio()
+        return (first_sim + last_sim + full_sim, full_sim, freq)
 
     best_name, _ = max(candidates, key=lambda item: rank(item[0], item[1]))
-    best_sim = SequenceMatcher(None, ql, best_name.lower()).ratio()
-    return best_name if best_sim >= 0.45 or (summary.persons[best_name] >= 2) else None
+    best_parts = _person_name_parts(best_name)
+    if len(best_parts) < 2:
+        return None
+    first_sim = SequenceMatcher(None, q_parts[0], best_parts[0]).ratio()
+    last_sim = SequenceMatcher(None, q_parts[-1], best_parts[-1]).ratio()
+    return best_name if (first_sim >= 0.72 and last_sim >= 0.72) else None
 
 
 def find_surname_token_suggestion(query: str, summary: EntitySummary) -> str | None:
@@ -360,15 +419,19 @@ def _rule_based_next_action(
 
 
 def build_ai_summary(
-    ranked: list[tuple[ChunkRecord, float]], summary: EntitySummary, timeline: list[TimelineEvent], query: str
+    ranked: list[tuple[ChunkRecord, float]],
+    summary: EntitySummary,
+    timeline: list[TimelineEvent],
+    query: str,
+    corpus_exact_name_hit: bool = False,
 ) -> str:
     if not ranked:
         return "Nothing came back for this query, so there is no profile to summarize yet."
 
     if _is_person_like_two_word_query(query) and not has_exact_full_name_hit(ranked, query):
         q = _person_phrase_from_query(query).strip()
-        closest = find_closest_person_match(query, summary)
-        if closest:
+        closest = find_closest_person_match(query, summary) if not corpus_exact_name_hit else None
+        if closest and not corpus_exact_name_hit:
             return (
                 f"No exact match was found for {q}. Closest related match: {closest}. "
                 "Showing nearby evidence for review."
@@ -428,6 +491,7 @@ def main() -> None:
     default_data_path = Path(__file__).resolve().parent / "data"
     data_root = Path(st.sidebar.text_input("Data folder", value=str(default_data_path)))
     use_cache = st.sidebar.toggle("Use disk cache for index", value=True)
+    rebuild_now = st.sidebar.button("Rebuild index now")
     top_k = st.sidebar.slider("Results (FAISS top-K)", min_value=5, max_value=50, value=15)
     keyword_boost = st.sidebar.slider("Keyword boost for hybrid ranking", 0.0, 0.25, 0.12)
 
@@ -444,6 +508,11 @@ def main() -> None:
     if not data_root.is_dir():
         st.warning(f"Data folder does not exist yet: `{data_root}`. Creating sample tree is recommended.")
         st.stop()
+
+    if rebuild_now:
+        shutil.rmtree(_cache_base(), ignore_errors=True)
+        st.cache_resource.clear()
+        st.sidebar.info("Cache cleared. Index will rebuild on this run.")
 
     fp = fingerprint_data_root(data_root)
     with st.spinner("Loading / building vector index…"):
@@ -534,9 +603,14 @@ def main() -> None:
     summary = summary_semantic
     edges = edges_semantic
     timeline = timeline_semantic
+    primary_evidence, related_evidence = _classify_evidence(ranked, query)
+    query_person_phrase = _person_phrase_from_query(query)
+    corpus_exact_name_hit = _is_person_like_two_word_query(query) and corpus_has_exact_phrase(
+        store.records, query_person_phrase
+    )
 
     st.subheader("AI Summary")
-    st.write(build_ai_summary(ranked, summary, timeline, query))
+    st.write(build_ai_summary(ranked, summary, timeline, query, corpus_exact_name_hit=corpus_exact_name_hit))
     q_tokens = [t for t in query.strip().lower().split() if len(t) > 1]
     if len(q_tokens) >= 2 and not has_exact_full_name_hit(ranked, query):
         st.info(
@@ -549,13 +623,25 @@ def main() -> None:
     )
 
     with res_tab:
-        st.subheader("Ranked evidence")
-        for r, score in ranked:
+        st.subheader("Primary evidence")
+        if not primary_evidence:
+            st.caption("No direct mention found in retrieved chunks for this query.")
+        for r, score in primary_evidence:
+            with st.expander(f"[{r.source_type}] {r.doc_title} — score {score:.3f}"):
+                st.markdown(highlight_query(r.text[:6000], query))
+                st.caption(f"`{r.source_file}` · `{r.chunk_id}`")
+        st.subheader("Related evidence")
+        st.caption("Contextual/related material; useful for leads but not direct proof of the queried entity.")
+        for r, score in related_evidence:
             with st.expander(f"[{r.source_type}] {r.doc_title} — score {score:.3f}"):
                 st.markdown(highlight_query(r.text[:6000], query))
                 st.caption(f"`{r.source_file}` · `{r.chunk_id}`")
 
     with ent_tab:
+        st.caption(
+            "Entity Profile aggregates extracted entities from retrieved evidence. It helps analysts spot repeated names, "
+            "vehicles, and phone numbers, but does not confirm identity by itself."
+        )
         c1, c2, c3 = st.columns(3)
         with c1:
             st.metric("Distinct persons", len(summary.persons))
@@ -585,6 +671,12 @@ def main() -> None:
             "Same-chunk pairs only. Strength blends co-occurrence count, span proximity inside each chunk, "
             "and a small boost when the pair appears across more than one source type."
         )
+        st.caption(
+            "Relationship strength is based on co-occurrence frequency, proximity within text, and whether entities appear "
+            "across multiple source types. Strong means frequent/nearby evidence; Medium means some supporting evidence; "
+            "Weak means indirect or limited evidence."
+        )
+        st.caption("These links indicate textual association only and do not prove a real-world relationship.")
         if not edges:
             st.write("No edges found for this result set.")
         else:

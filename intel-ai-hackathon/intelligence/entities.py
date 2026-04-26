@@ -49,6 +49,19 @@ _VEHICLE_WORDS = {
 }
 
 
+def normalize_phone_number(raw: str) -> str | None:
+    """Canonical SG phone format: 8 digits (strip +65/65 prefix when applicable)."""
+    compact = re.sub(r"[\s\-\(\)]", "", raw.strip())
+    digits = re.sub(r"\D", "", compact)
+    if len(digits) >= 10 and (digits.startswith("65")):
+        tail = digits[2:]
+        if len(tail) == 8:
+            return tail
+    if len(digits) == 8:
+        return digits
+    return None
+
+
 @dataclass
 class EntityHit:
     label: str  # person | vehicle | phone
@@ -64,15 +77,6 @@ class EntitySummary:
     phones: Counter[str] = field(default_factory=Counter)
 
 
-def _normalize_phone(raw: str) -> str | None:
-    digits = re.sub(r"\D", "", raw)
-    if len(digits) < 8:
-        return None
-    if len(digits) > 15:
-        return None
-    return digits
-
-
 def extract_entities_regex(text: str) -> list[EntityHit]:
     hits: list[EntityHit] = []
     seen_spans: set[tuple[int, int, str]] = set()
@@ -86,9 +90,9 @@ def extract_entities_regex(text: str) -> list[EntityHit]:
 
     for rx in _PHONE_PATTERNS:
         for m in rx.finditer(text):
-            norm = _normalize_phone(m.group(0))
+            norm = normalize_phone_number(m.group(0))
             if norm:
-                add("phone", m.group(0), m.start(), m.end())
+                add("phone", norm, m.start(), m.end())
 
     for rx in _PLATE_PATTERNS:
         for m in rx.finditer(text):
@@ -194,7 +198,7 @@ def summarize_entities(hits: list[EntityHit]) -> EntitySummary:
         elif h.label == "vehicle":
             s.vehicles[key] += 1
         elif h.label == "phone":
-            norm = _normalize_phone(key) or key
+            norm = normalize_phone_number(key) or key
             s.phones[norm] += 1
     return s
 
@@ -209,6 +213,8 @@ def merge_summaries(*summaries: EntitySummary) -> EntitySummary:
 
 
 def _entity_key(h: EntityHit) -> str:
+    if h.label == "phone":
+        return f"phone:{normalize_phone_number(h.text) or h.text.strip()}"
     return f"{h.label}:{h.text.strip()}"
 
 
@@ -239,6 +245,46 @@ def _chunk_pair_min_gaps(hits: list[EntityHit]) -> dict[tuple[str, str], int]:
     return out
 
 
+def _split_sentences_with_offsets(text: str) -> list[tuple[str, int]]:
+    parts: list[tuple[str, int]] = []
+    for m in re.finditer(r"[^.!?\n]+[.!?]?", text):
+        sent = m.group(0).strip()
+        if sent:
+            parts.append((sent, m.start()))
+    if not parts and text.strip():
+        parts.append((text.strip(), 0))
+    return parts
+
+
+def _sentence_pair_boost(text: str, hits: list[EntityHit]) -> dict[tuple[str, str], float]:
+    boosts: dict[tuple[str, str], float] = defaultdict(float)
+    if not text or not hits:
+        return boosts
+    sentences = _split_sentences_with_offsets(text)
+    if not sentences:
+        return boosts
+    for sent, offset in sentences:
+        sent_hits = [
+            h for h in hits if h.span_start >= offset and h.span_end <= (offset + len(sent))
+        ]
+        if len(sent_hits) < 2:
+            continue
+        for i in range(len(sent_hits)):
+            for j in range(i + 1, len(sent_hits)):
+                ka, kb = _entity_key(sent_hits[i]), _entity_key(sent_hits[j])
+                if ka == kb:
+                    continue
+                a, b = (ka, kb) if ka <= kb else (kb, ka)
+                kinds = {a.split(":", 1)[0], b.split(":", 1)[0]}
+                if kinds == {"person", "phone"}:
+                    boosts[(a, b)] += 1.35
+                elif kinds == {"phone", "vehicle"}:
+                    boosts[(a, b)] += 0.70
+                else:
+                    boosts[(a, b)] += 0.20
+    return boosts
+
+
 def cooccurrence_edges(
     chunks_with_entities: list[tuple[str, list[EntityHit], str | None]],
     min_weight: int = 1,
@@ -256,16 +302,19 @@ def cooccurrence_edges(
     prox_sum: dict[tuple[str, str], float] = defaultdict(float)
     sources: dict[tuple[str, str], set[str]] = defaultdict(set)
     min_gap: dict[tuple[str, str], int] = defaultdict(lambda: 10**9)
+    sentence_boost: dict[tuple[str, str], float] = defaultdict(float)
 
-    for _text, hits, source_tag in chunks_with_entities:
+    for text, hits, source_tag in chunks_with_entities:
         pairs = _chunk_pair_min_gaps(hits)
         if not pairs:
             continue
         tag = (source_tag or "").strip() or "unknown"
+        sent_boosts = _sentence_pair_boost(text, hits)
         for (a, b), gap in pairs.items():
             freq[(a, b)] += 1
             prox_sum[(a, b)] += 1.0 / (1.0 + gap / 72.0)
             sources[(a, b)].add(tag)
+            sentence_boost[(a, b)] += sent_boosts.get((a, b), 0.0)
             if gap < min_gap[(a, b)]:
                 min_gap[(a, b)] = gap
 
@@ -276,7 +325,7 @@ def cooccurrence_edges(
         n_src = len(sources[key])
         cross = 0.24 * max(0, n_src - 1)
         avg_prox = prox_sum[key] / freq[key]
-        raw_scores[key] = freq[key] * (0.28 + 0.72 * avg_prox) + cross
+        raw_scores[key] = freq[key] * (0.28 + 0.72 * avg_prox) + cross + sentence_boost[key]
 
     if not raw_scores:
         return []
