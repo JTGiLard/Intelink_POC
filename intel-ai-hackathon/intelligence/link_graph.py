@@ -605,7 +605,7 @@ def build_entity_link_graph_figure(
                 y=[None],
                 mode="markers",
                 marker=dict(size=11, color="#059669", symbol="square", line=dict(width=1, color="#0f172a")),
-                name="Vehicle (plate)",
+                name="Vehicle / plate",
                 showlegend=True,
                 hoverinfo="skip",
             )
@@ -638,7 +638,7 @@ def build_entity_link_graph_figure(
                 y=[None, None],
                 mode="lines",
                 line=dict(color="#0f172a", width=3.5, dash="solid"),
-                name="Solid line = direct relationship",
+                name="Solid = direct",
                 showlegend=True,
                 hoverinfo="skip",
             )
@@ -649,7 +649,7 @@ def build_entity_link_graph_figure(
                 y=[None, None],
                 mode="lines",
                 line=dict(color="#0f172a", width=3.5, dash="dash"),
-                name="Dashed line = indirect relationship",
+                name="Dashed = indirect",
                 showlegend=True,
                 hoverinfo="skip",
             )
@@ -697,6 +697,7 @@ def build_entity_link_graph_figure(
                 textfont=dict(size=11, color="#0f172a"),
                 hoverinfo="text",
                 hovertext=node_list,
+                showlegend=False,
             )
         )
         fig.update_layout(

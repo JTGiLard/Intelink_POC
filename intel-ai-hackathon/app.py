@@ -187,6 +187,29 @@ def _classify_evidence(
     phone_norm = normalize_phone_number(query)
     vehicle_norm = _vehicle_query_normalized(query)
 
+    def extract_strong_identifiers(text: str) -> set[str]:
+        ids: set[str] = set()
+        for h in extract_all_entities(text):
+            value = h.text.strip()
+            if not value:
+                continue
+            if h.label == "phone":
+                ids.add(f"phone:{normalize_phone_number(value) or value}")
+            elif h.label == "vehicle":
+                ids.add(f"vehicle:{_vehicle_query_normalized(value)}")
+            elif h.label == "person":
+                ids.add(f"person:{' '.join(value.lower().split())}")
+        for m in re.finditer(r"\b[STFG]\d{7}[A-Z]\b", text, flags=re.IGNORECASE):
+            ids.add(f"nric:{m.group(0).upper()}")
+        for m in re.finditer(r"\b(?:CASE|CID|CR|INV)[-\s]?\d{2,}\b", text, flags=re.IGNORECASE):
+            ids.add(f"case:{re.sub(r'\\s+', '', m.group(0).upper())}")
+        company_rx = re.compile(
+            r"\b([A-Z][A-Za-z0-9&'()\-]*(?:\s+[A-Z][A-Za-z0-9&'()\-]*){0,5}\s+(?:Pte\.?\s+Ltd|Ltd|LLP|Inc\.?|Corp\.?))\b"
+        )
+        for m in company_rx.finditer(text):
+            ids.add(f"company:{' '.join(m.group(1).lower().split())}")
+        return ids
+
     primary: list[tuple[ChunkRecord, float]] = []
     related: list[tuple[ChunkRecord, float]] = []
     for r, score in ranked:
@@ -194,12 +217,33 @@ def _classify_evidence(
         if person_two_word and person_phrase:
             is_primary = person_phrase.lower() in text_l
         elif phone_norm:
-            is_primary = normalize_phone_number(r.text) == phone_norm or (phone_norm in re.sub(r"\D", "", r.text))
+            chunk_phones = {
+                normalize_phone_number(h.text)
+                for h in extract_all_entities(r.text)
+                if h.label == "phone"
+            }
+            is_primary = phone_norm in {p for p in chunk_phones if p}
         elif _is_vehicle_or_plate_query(query):
             is_primary = vehicle_norm in _vehicle_query_normalized(r.text)
         else:
             is_primary = query.strip().lower() in text_l
         (primary if is_primary else related).append((r, score))
+    if person_two_word and person_phrase:
+        if not primary:
+            related = []
+        else:
+            primary_ids: set[str] = set()
+            for pr, _ in primary:
+                primary_ids |= extract_strong_identifiers(pr.text)
+            if primary_ids:
+                filtered_related: list[tuple[ChunkRecord, float]] = []
+                for rr, ss in related:
+                    related_ids = extract_strong_identifiers(rr.text)
+                    if primary_ids & related_ids:
+                        filtered_related.append((rr, ss))
+                related = filtered_related
+            else:
+                related = []
     return primary, related
 
 
@@ -276,9 +320,8 @@ def find_closest_person_match(query: str, summary: EntitySummary) -> str | None:
             return (-1.0, -1.0, freq)
         first_sim = SequenceMatcher(None, q_parts[0], parts[0]).ratio()
         last_sim = SequenceMatcher(None, q_parts[-1], parts[-1]).ratio()
-        token_overlap = len(set(q_parts) & set(parts))
-        # Require both parts reasonably similar OR one exact token with strong support.
-        if not ((first_sim >= 0.72 and last_sim >= 0.72) or (token_overlap >= 1 and freq >= 3 and (first_sim + last_sim) >= 1.45)):
+        # Require both first-name and surname similarity for full-name fallback.
+        if not (first_sim >= 0.72 and last_sim >= 0.72):
             return (-1.0, -1.0, freq)
         full_sim = SequenceMatcher(None, ql, name.lower()).ratio()
         return (first_sim + last_sim + full_sim, full_sim, freq)
@@ -627,20 +670,26 @@ def main() -> None:
         if not primary_evidence:
             st.caption("No direct mention found in retrieved chunks for this query.")
         for r, score in primary_evidence:
-            with st.expander(f"[{r.source_type}] {r.doc_title} — score {score:.3f}"):
+            with st.expander(f"[{r.source_type}] {r.doc_title} — search relevance score {score:.3f}"):
                 st.markdown(highlight_query(r.text[:6000], query))
                 st.caption(f"`{r.source_file}` · `{r.chunk_id}`")
-        st.subheader("Related evidence")
-        st.caption("Contextual/related material; useful for leads but not direct proof of the queried entity.")
+        st.subheader("Linked evidence")
+        st.caption(
+            "Shown only when evidence shares strong identifiers with Primary evidence "
+            "(for example phone, vehicle/plate, NRIC, case ID, company, or named associate)."
+        )
         for r, score in related_evidence:
-            with st.expander(f"[{r.source_type}] {r.doc_title} — score {score:.3f}"):
+            with st.expander(f"[{r.source_type}] {r.doc_title} — search relevance score {score:.3f}"):
                 st.markdown(highlight_query(r.text[:6000], query))
                 st.caption(f"`{r.source_file}` · `{r.chunk_id}`")
 
     with ent_tab:
         st.caption(
-            "Entity Profile aggregates extracted entities from retrieved evidence. It helps analysts spot repeated names, "
-            "vehicles, and phone numbers, but does not confirm identity by itself."
+            "This aggregates entities from retrieved evidence. It helps analysts spot repeated names, vehicles and phones, "
+            "but does not confirm identity or relationship."
+        )
+        st.caption(
+            "Alias-like entries are treated as independent mentions unless they are supported by Primary or Linked evidence."
         )
         c1, c2, c3 = st.columns(3)
         with c1:

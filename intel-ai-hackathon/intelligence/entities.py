@@ -51,12 +51,13 @@ _VEHICLE_WORDS = {
 
 def normalize_phone_number(raw: str) -> str | None:
     """Canonical SG phone format: 8 digits (strip +65/65 prefix when applicable)."""
-    compact = re.sub(r"[\s\-\(\)]", "", raw.strip())
-    digits = re.sub(r"\D", "", compact)
-    if len(digits) >= 10 and (digits.startswith("65")):
-        tail = digits[2:]
-        if len(tail) == 8:
-            return tail
+    digits = re.sub(r"\D", "", raw.strip())
+    if not digits:
+        return None
+    if digits.startswith("0065"):
+        digits = digits[4:]
+    elif digits.startswith("65") and len(digits) >= 10:
+        digits = digits[2:]
     if len(digits) == 8:
         return digits
     return None
@@ -277,12 +278,33 @@ def _sentence_pair_boost(text: str, hits: list[EntityHit]) -> dict[tuple[str, st
                 a, b = (ka, kb) if ka <= kb else (kb, ka)
                 kinds = {a.split(":", 1)[0], b.split(":", 1)[0]}
                 if kinds == {"person", "phone"}:
-                    boosts[(a, b)] += 1.35
+                    boosts[(a, b)] += 2.25
                 elif kinds == {"phone", "vehicle"}:
                     boosts[(a, b)] += 0.70
                 else:
                     boosts[(a, b)] += 0.20
     return boosts
+
+
+def _sentence_direct_pairs(text: str, hits: list[EntityHit]) -> set[tuple[str, str]]:
+    out: set[tuple[str, str]] = set()
+    if not text or not hits:
+        return out
+    sentences = _split_sentences_with_offsets(text)
+    for sent, offset in sentences:
+        sent_hits = [h for h in hits if h.span_start >= offset and h.span_end <= (offset + len(sent))]
+        if len(sent_hits) < 2:
+            continue
+        for i in range(len(sent_hits)):
+            for j in range(i + 1, len(sent_hits)):
+                ka, kb = _entity_key(sent_hits[i]), _entity_key(sent_hits[j])
+                if ka == kb:
+                    continue
+                a, b = (ka, kb) if ka <= kb else (kb, ka)
+                kinds = {a.split(":", 1)[0], b.split(":", 1)[0]}
+                if kinds == {"person", "phone"}:
+                    out.add((a, b))
+    return out
 
 
 def cooccurrence_edges(
@@ -303,6 +325,7 @@ def cooccurrence_edges(
     sources: dict[tuple[str, str], set[str]] = defaultdict(set)
     min_gap: dict[tuple[str, str], int] = defaultdict(lambda: 10**9)
     sentence_boost: dict[tuple[str, str], float] = defaultdict(float)
+    sentence_direct: set[tuple[str, str]] = set()
 
     for text, hits, source_tag in chunks_with_entities:
         pairs = _chunk_pair_min_gaps(hits)
@@ -310,6 +333,7 @@ def cooccurrence_edges(
             continue
         tag = (source_tag or "").strip() or "unknown"
         sent_boosts = _sentence_pair_boost(text, hits)
+        sentence_direct |= _sentence_direct_pairs(text, hits)
         for (a, b), gap in pairs.items():
             freq[(a, b)] += 1
             prox_sum[(a, b)] += 1.0 / (1.0 + gap / 72.0)
@@ -344,7 +368,7 @@ def cooccurrence_edges(
             label = "Medium"
         else:
             label = "Weak"
-        lt = "direct" if min_gap[(a, b)] <= direct_gap_max else "indirect"
+        lt = "direct" if (min_gap[(a, b)] <= direct_gap_max or (a, b) in sentence_direct) else "indirect"
         edges.append((a, b, round(raw, 4), label, lt))
 
     edges.sort(key=lambda e: -e[2])
