@@ -1,0 +1,8 @@
+From: analyst.unit@example.com
+To: ops@example.com
+Subject: Suspicious vehicle alert
+Date: 2026-04-11 08:30:00 +0800
+
+Please note John Tan booked a ride using +65 81238899.
+Vehicle SGB1234X was seen near warehouse gate.
+Add to border watch and correlate with prior records.

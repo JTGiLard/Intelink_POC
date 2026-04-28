@@ -1,0 +1,6 @@
+VEHICLE SEARCH LOG TT-2026-02
+Date observed: 2026-05-09 12:00:00
+
+Vehicle dashboard search returned owner Tan Ah Teck linked to motorcycle ABC321A.
+IU label number: IU778899.
+Road tax valid until 06/07/2026.
