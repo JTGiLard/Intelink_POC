@@ -178,6 +178,81 @@ def _is_vehicle_or_plate_query(query: str) -> bool:
     return bool(re.fullmatch(r"[A-Z]{1,3}\d{1,4}[A-Z]?", q))
 
 
+def _extract_strong_identifiers(text: str) -> set[str]:
+    ids: set[str] = set()
+    for h in extract_all_entities(text):
+        value = h.text.strip()
+        if not value:
+            continue
+        if h.label == "phone":
+            ids.add(f"phone:{normalize_phone_number(value) or value}")
+        elif h.label == "vehicle":
+            ids.add(f"vehicle:{_vehicle_query_normalized(value)}")
+        elif h.label == "person":
+            ids.add(f"person:{' '.join(value.lower().split())}")
+    for m in re.finditer(r"\b[STFG]\d{7}[A-Z]\b", text, flags=re.IGNORECASE):
+        ids.add(f"nric:{m.group(0).upper()}")
+    for m in re.finditer(r"\b(?:CASE|CID|CR|INV)[-\s]?\d{2,}\b", text, flags=re.IGNORECASE):
+        ids.add(f"case:{re.sub(r'\\s+', '', m.group(0).upper())}")
+    company_rx = re.compile(
+        r"\b([A-Z][A-Za-z0-9&'()\-]*(?:\s+[A-Z][A-Za-z0-9&'()\-]*){0,5}\s+(?:Pte\.?\s+Ltd|Ltd|LLP|Inc\.?|Corp\.?))\b"
+    )
+    for m in company_rx.finditer(text):
+        ids.add(f"company:{' '.join(m.group(1).lower().split())}")
+    return ids
+
+
+def _filter_person_centric_graph_edges(
+    edges: list[tuple[str, str, float, str, str]],
+    primary_evidence: list[tuple[ChunkRecord, float]],
+    linked_evidence: list[tuple[ChunkRecord, float]],
+    anchor_person: str,
+) -> list[tuple[str, str, float, str, str]]:
+    if not edges or not anchor_person.strip():
+        return edges
+    anchor_key = f"person:{' '.join(anchor_person.strip().lower().split())}"
+
+    primary_ids: set[str] = set()
+    allowed_persons: set[str] = {anchor_key}
+    for r, _ in primary_evidence:
+        ids = _extract_strong_identifiers(r.text)
+        primary_ids |= {i for i in ids if not i.startswith("person:")}
+        allowed_persons |= {i for i in ids if i.startswith("person:")}
+
+    if not primary_ids:
+        # If no strong identifiers are available, remain conservative and keep only
+        # edges touching person mentions that occurred in exact primary evidence.
+        return [
+            e
+            for e in edges
+            if (
+                (e[0].startswith("person:") and e[0].lower() in allowed_persons)
+                or (e[1].startswith("person:") and e[1].lower() in allowed_persons)
+            )
+        ]
+
+    for r, _ in linked_evidence:
+        ids = _extract_strong_identifiers(r.text)
+        if primary_ids & ids:
+            allowed_persons |= {i for i in ids if i.startswith("person:")}
+
+    allowed_nodes: set[str] = set(primary_ids) | allowed_persons
+
+    def node_ok(node: str) -> bool:
+        nl = node.lower()
+        if nl.startswith("person:"):
+            return nl in allowed_persons
+        # Keep key identifier node types only when validated against primary IDs.
+        if nl.startswith(("phone:", "vehicle:", "nric:", "case:", "company:")):
+            return nl in allowed_nodes
+        return True
+
+    filtered = [e for e in edges if node_ok(e[0]) and node_ok(e[1])]
+    # Ensure anchor remains central if present.
+    anchor_edges = [e for e in filtered if e[0].lower() == anchor_key or e[1].lower() == anchor_key]
+    return anchor_edges + [e for e in filtered if e not in anchor_edges]
+
+
 def _classify_evidence(
     ranked: list[tuple[ChunkRecord, float]],
     query: str,
@@ -186,29 +261,6 @@ def _classify_evidence(
     person_two_word = _is_person_like_two_word_query(query)
     phone_norm = normalize_phone_number(query)
     vehicle_norm = _vehicle_query_normalized(query)
-
-    def extract_strong_identifiers(text: str) -> set[str]:
-        ids: set[str] = set()
-        for h in extract_all_entities(text):
-            value = h.text.strip()
-            if not value:
-                continue
-            if h.label == "phone":
-                ids.add(f"phone:{normalize_phone_number(value) or value}")
-            elif h.label == "vehicle":
-                ids.add(f"vehicle:{_vehicle_query_normalized(value)}")
-            elif h.label == "person":
-                ids.add(f"person:{' '.join(value.lower().split())}")
-        for m in re.finditer(r"\b[STFG]\d{7}[A-Z]\b", text, flags=re.IGNORECASE):
-            ids.add(f"nric:{m.group(0).upper()}")
-        for m in re.finditer(r"\b(?:CASE|CID|CR|INV)[-\s]?\d{2,}\b", text, flags=re.IGNORECASE):
-            ids.add(f"case:{re.sub(r'\\s+', '', m.group(0).upper())}")
-        company_rx = re.compile(
-            r"\b([A-Z][A-Za-z0-9&'()\-]*(?:\s+[A-Z][A-Za-z0-9&'()\-]*){0,5}\s+(?:Pte\.?\s+Ltd|Ltd|LLP|Inc\.?|Corp\.?))\b"
-        )
-        for m in company_rx.finditer(text):
-            ids.add(f"company:{' '.join(m.group(1).lower().split())}")
-        return ids
 
     primary: list[tuple[ChunkRecord, float]] = []
     related: list[tuple[ChunkRecord, float]] = []
@@ -234,11 +286,11 @@ def _classify_evidence(
         else:
             primary_ids: set[str] = set()
             for pr, _ in primary:
-                primary_ids |= extract_strong_identifiers(pr.text)
+                primary_ids |= _extract_strong_identifiers(pr.text)
             if primary_ids:
                 filtered_related: list[tuple[ChunkRecord, float]] = []
                 for rr, ss in related:
-                    related_ids = extract_strong_identifiers(rr.text)
+                    related_ids = _extract_strong_identifiers(rr.text)
                     if primary_ids & related_ids:
                         filtered_related.append((rr, ss))
                 related = filtered_related
@@ -461,11 +513,132 @@ def _rule_based_next_action(
     )
 
 
+def _dedupe_preserve_order(items: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        key = " ".join(item.strip().lower().split())
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(item.strip())
+    return out
+
+
+def _extract_phone_mentions(text: str) -> list[str]:
+    pattern = re.compile(r"(?:\+65[\s-]?)?[689]\d{3}[\s-]?\d{4}")
+    found = [m.group(0).strip() for m in pattern.finditer(text)]
+    return _dedupe_preserve_order(found)
+
+
+def build_intelligence_brief(
+    summary: EntitySummary,
+    primary_evidence: list[tuple[ChunkRecord, float]],
+    linked_evidence: list[tuple[ChunkRecord, float]],
+    query: str,
+) -> str:
+    subject = _person_phrase_from_query(query).strip() or _summary_subject(query, summary)
+    combined = primary_evidence + linked_evidence
+    texts = [r.text for r, _ in combined]
+    all_text = "\n".join(texts)
+
+    contact_bullets: list[str] = []
+    for phone, _ in summary.phones.most_common(6):
+        snippets: list[str] = []
+        for text in texts:
+            if phone in (normalize_phone_number(p) or "" for p in _extract_phone_mentions(text)):
+                hit = re.search(rf"(?i)([^.\n]{{0,90}}{re.escape(phone)}[^.\n]{{0,90}})", text)
+                if hit:
+                    context = " ".join(hit.group(1).split())
+                    snippets.append(context)
+        if snippets:
+            contact_bullets.append(f"- {phone}: reported as {snippets[0]}.")
+        else:
+            contact_bullets.append(f"- {phone}: linked to retrieved records.")
+        if len(contact_bullets) >= 4:
+            break
+
+    vehicle_bullets: list[str] = []
+    for vehicle, _ in summary.vehicles.most_common(6):
+        contexts: list[str] = []
+        for text in texts:
+            if vehicle.upper().replace(" ", "") in _vehicle_query_normalized(text):
+                m = re.search(rf"(?i)([^.\n]{{0,95}}{re.escape(vehicle)}[^.\n]{{0,95}})", text)
+                if m:
+                    contexts.append(" ".join(m.group(1).split()))
+        if contexts:
+            vehicle_bullets.append(f"- {vehicle}: observed with {contexts[0]}.")
+        else:
+            vehicle_bullets.append(f"- {vehicle}: associated with retrieved records.")
+        if len(vehicle_bullets) >= 4:
+            break
+
+    person_parts = _person_name_parts(subject)
+    relationship_bullets: list[str] = []
+    associates = []
+    for person, _ in summary.persons.most_common(12):
+        p_parts = _person_name_parts(person)
+        if not p_parts:
+            continue
+        if " ".join(p_parts) == " ".join(person_parts):
+            continue
+        associates.append(person)
+    associates = _dedupe_preserve_order(associates)
+    if associates:
+        relationship_bullets.append(
+            f"- Associates: {', '.join(associates[:3])} were observed with or linked to {subject} in the same records."
+        )
+
+    date_hit = re.search(r"\b(20\d{2}[-/]\d{1,2}[-/]\d{1,2})\b", all_text)
+    meeting_hit = re.search(r"(?i)\b(meet(?:ing)?|handover|checkpoint|block\s+\d+)\b", all_text)
+    if date_hit or meeting_hit:
+        when = date_hit.group(1) if date_hit else "the retrieved period"
+        what = meeting_hit.group(1) if meeting_hit else "activity points"
+        relationship_bullets.append(f"- Observation: {subject} was reported as linked to {what} around {when}.")
+
+    if not relationship_bullets and linked_evidence:
+        relationship_bullets.append(
+            f"- Linked evidence: {len(linked_evidence)} records share identifiers with primary evidence for {subject}."
+        )
+
+    summary_line = (
+        f"{subject} is linked to {len(primary_evidence)} primary evidence record"
+        f"{'s' if len(primary_evidence) != 1 else ''}"
+    )
+    if linked_evidence:
+        summary_line += f" and {len(linked_evidence)} validated linked evidence record{'s' if len(linked_evidence) != 1 else ''}."
+    else:
+        summary_line += "."
+
+    next_step = (
+        "Review the timeline and verify whether phone, vehicle, and meeting references align to one operational sequence."
+    )
+    if not vehicle_bullets and not contact_bullets:
+        next_step = "Review primary records for additional direct identifiers before expanding to broader semantic matches."
+
+    sections = [f"Summary:\n{summary_line}"]
+    if contact_bullets:
+        sections.append("Contact Numbers:\n" + "\n".join(contact_bullets))
+    if vehicle_bullets:
+        sections.append("Associated Vehicles:\n" + "\n".join(vehicle_bullets))
+    if relationship_bullets:
+        sections.append("Key Relationships & Intelligence:\n" + "\n".join(relationship_bullets[:3]))
+    sections.append(f"Suggested Next Step:\n{next_step}")
+
+    brief = "\n\n".join(sections)
+    words = brief.split()
+    if len(words) > 180:
+        brief = " ".join(words[:180]).rstrip() + "..."
+    return brief
+
+
 def build_ai_summary(
     ranked: list[tuple[ChunkRecord, float]],
     summary: EntitySummary,
     timeline: list[TimelineEvent],
     query: str,
+    primary_evidence: list[tuple[ChunkRecord, float]] | None = None,
+    linked_evidence: list[tuple[ChunkRecord, float]] | None = None,
     corpus_exact_name_hit: bool = False,
 ) -> str:
     if not ranked:
@@ -490,6 +663,11 @@ def build_ai_summary(
                     f"No exact match was found for '{q}'. Closest related alias: {alias_suggestion}. "
                     "Showing semantically related evidence only."
                 )
+
+    primary_evidence = primary_evidence or []
+    linked_evidence = linked_evidence or []
+    if _is_person_like_two_word_query(query) and has_exact_full_name_hit(ranked, query):
+        return build_intelligence_brief(summary, primary_evidence, linked_evidence, query)
 
     subject = _summary_subject(query, summary)
     n = len(ranked)
@@ -643,17 +821,31 @@ def main() -> None:
     summary_semantic, edges_semantic, timeline_semantic = aggregate_dashboard(ranked_semantic, query)
 
     ranked = ranked_semantic
+    primary_evidence, related_evidence = _classify_evidence(ranked, query)
     summary = summary_semantic
     edges = edges_semantic
     timeline = timeline_semantic
-    primary_evidence, related_evidence = _classify_evidence(ranked, query)
+    if _is_person_like_two_word_query(query) and has_exact_full_name_hit(ranked, query):
+        evidence_pool = primary_evidence + related_evidence
+        if evidence_pool:
+            summary, edges, timeline = aggregate_dashboard(evidence_pool, query)
     query_person_phrase = _person_phrase_from_query(query)
     corpus_exact_name_hit = _is_person_like_two_word_query(query) and corpus_has_exact_phrase(
         store.records, query_person_phrase
     )
 
     st.subheader("AI Summary")
-    st.write(build_ai_summary(ranked, summary, timeline, query, corpus_exact_name_hit=corpus_exact_name_hit))
+    st.write(
+        build_ai_summary(
+            ranked,
+            summary,
+            timeline,
+            query,
+            primary_evidence=primary_evidence,
+            linked_evidence=related_evidence,
+            corpus_exact_name_hit=corpus_exact_name_hit,
+        )
+    )
     q_tokens = [t for t in query.strip().lower().split() if len(t) > 1]
     if len(q_tokens) >= 2 and not has_exact_full_name_hit(ranked, query):
         st.info(
@@ -731,9 +923,17 @@ def main() -> None:
         else:
             use_person_centric = _is_person_like_two_word_query(query) and has_exact_full_name_hit(ranked, query)
             anchor_person = _person_phrase_from_query(query) if use_person_centric else ""
+            graph_edges = edges
+            if use_person_centric and anchor_person:
+                graph_edges = _filter_person_centric_graph_edges(
+                    edges,
+                    primary_evidence,
+                    related_evidence,
+                    anchor_person,
+                )
             gfig, gnote = build_entity_link_graph_figure(
                 ranked,
-                edges,
+                graph_edges,
                 query,
                 person_centric=use_person_centric,
                 anchor_person=anchor_person,
@@ -745,12 +945,12 @@ def main() -> None:
             else:
                 st.warning("Graph failed to render but edges exist")
             df_e = pd.DataFrame(
-                edges,
+                graph_edges,
                 columns=["Entity A", "Entity B", "Strength", "Strength label", "Link type"],
             )
             st.dataframe(df_e, use_container_width=True, height=420)
             st.subheader("Strongest links")
-            for a, b, s, lbl, lt in edges[:12]:
+            for a, b, s, lbl, lt in graph_edges[:12]:
                 st.write(f"- **{a}** ↔ **{b}** — strength {s} ({lbl}, {lt})")
 
     with time_tab:
