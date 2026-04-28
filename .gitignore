@@ -1,0 +1,16 @@
+.env
+venv/
+.venv/
+__pycache__/
+*.pyc
+.cache_index/
+.streamlit/
+.cursor/
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
+AppData/
+Documents/
+Downloads/
+OneDrive/

@@ -1,0 +1,7 @@
+From: parking.analysis@example.com
+To: intel.team@example.com
+Subject: Parking log overlap note
+Date: 2026-05-10 23:50:00 +0800
+
+Parking records show vehicle ABC321A entered carpark AMK45 at 2105 hrs and exited at 2350 hrs.
+Follow-up review noted overlap with phone 92334455 and prior consignment case.

@@ -1,0 +1,15 @@
+From: analyst.unit@example.com
+To: ops@example.com
+Subject: Re: John Tan — movement pattern
+Date: Mon, 7 Apr 2026 16:42:00 +0800
+
+Team,
+
+John Tan booked a ride using phone +65 8123-8899. Same handset IMEI cluster as earlier pings.
+
+Please correlate with WhatsApp export from handset dump folder /deviceA.
+
+Also flag plate SJK 88 for border watch; linked vehicle Honda Civic seen in carpark footage.
+
+Regards,
+Unit 4
