@@ -592,8 +592,49 @@ def build_ai_summary(
     return build_intelligence_summary(primary_evidence, linked_evidence, query)
 
 
+def _render_login_gate() -> bool:
+    if "authenticated" not in st.session_state:
+        st.session_state["authenticated"] = False
+
+    if st.session_state["authenticated"] is True:
+        return True
+
+    st.write("DEBUG: login gate active")
+    st.title("Login")
+    username = st.text_input("Username")
+    password = st.text_input("Password", type="password")
+
+    if st.button("Login"):
+        if username == "admin" and password == "admin123":
+            st.session_state["authenticated"] = True
+            st.rerun()
+        else:
+            st.error("Invalid username or password")
+
+    return False
+
+
 def main() -> None:
     st.set_page_config(page_title="Intel Search", layout="wide", initial_sidebar_state="expanded")
+    st.write("DEPLOY DEBUG: app.py commit 339b9f3 loaded")
+    st.write("AUTH DEBUG before gate:", st.session_state.get("authenticated"))
+
+    if st.query_params.get("reset") == "1":
+        st.session_state.clear()
+        st.query_params.clear()
+        st.rerun()
+
+    if not _render_login_gate():
+        st.stop()
+
+    st.sidebar.write("AUTH DEBUG:", st.session_state.get("authenticated"))
+    st.sidebar.caption("Logged in as admin")
+    if st.sidebar.button("Logout"):
+        st.session_state.pop("authenticated", None)
+        st.session_state.pop("active_query", None)
+        st.session_state.pop("qbox", None)
+        st.rerun()
+
     st.title("AI-powered intelligence search")
     st.caption("Semantic search with FAISS, OpenAI embeddings, and entity-aware analytics.")
 
