@@ -525,110 +525,113 @@ def _dedupe_preserve_order(items: list[str]) -> list[str]:
     return out
 
 
+def _normalize_person_name(name: str) -> str:
+    return " ".join(name.strip().lower().split())
+
+
+def _strong_summary_identifiers(text: str) -> set[str]:
+    ids: set[str] = set()
+    for h in extract_all_entities(text):
+        value = h.text.strip()
+        if not value:
+            continue
+        if h.label == "phone":
+            norm = normalize_phone_number(value)
+            if norm:
+                ids.add(f"phone:{norm}")
+        elif h.label == "vehicle":
+            veh = _vehicle_query_normalized(value)
+            if veh:
+                ids.add(f"vehicle:{veh}")
+    for m in re.finditer(r"\b[STFG]\d{7}[A-Z]\b", text, flags=re.IGNORECASE):
+        ids.add(f"nric:{m.group(0).upper()}")
+    company_rx = re.compile(
+        r"\b([A-Z][A-Za-z0-9&'()\-]*(?:\s+[A-Z][A-Za-z0-9&'()\-]*){0,5}\s+(?:Pte\.?\s+Ltd|Ltd|LLP|Inc\.?|Corp\.?))\b"
+    )
+    for m in company_rx.finditer(text):
+        ids.add(f"company:{' '.join(m.group(1).lower().split())}")
+    return ids
+
+
 def _extract_phone_mentions(text: str) -> list[str]:
     pattern = re.compile(r"(?:\+65[\s-]?)?[689]\d{3}[\s-]?\d{4}")
     found = [m.group(0).strip() for m in pattern.finditer(text)]
     return _dedupe_preserve_order(found)
 
 
-def build_intelligence_brief(
-    summary: EntitySummary,
+def build_intelligence_summary(
     primary_evidence: list[tuple[ChunkRecord, float]],
     linked_evidence: list[tuple[ChunkRecord, float]],
     query: str,
 ) -> str:
-    subject = _person_phrase_from_query(query).strip() or _summary_subject(query, summary)
-    combined = primary_evidence + linked_evidence
-    texts = [r.text for r, _ in combined]
-    all_text = "\n".join(texts)
+    subject = _person_phrase_from_query(query).strip() or query.strip() or "the queried subject"
+    primary_ids: set[str] = set()
+    for r, _ in primary_evidence:
+        primary_ids |= _strong_summary_identifiers(r.text)
+
+    validated_linked: list[tuple[ChunkRecord, float]] = []
+    for r, s in linked_evidence:
+        if primary_ids & _strong_summary_identifiers(r.text):
+            validated_linked.append((r, s))
+
+    evidence_pool = primary_evidence + validated_linked
+    all_hits = []
+    for r, _ in evidence_pool:
+        all_hits.extend(extract_all_entities(r.text))
+    summary = summarize_entities(all_hits)
 
     contact_bullets: list[str] = []
-    for phone, _ in summary.phones.most_common(6):
-        snippets: list[str] = []
-        for text in texts:
-            if phone in (normalize_phone_number(p) or "" for p in _extract_phone_mentions(text)):
-                hit = re.search(rf"(?i)([^.\n]{{0,90}}{re.escape(phone)}[^.\n]{{0,90}})", text)
-                if hit:
-                    context = " ".join(hit.group(1).split())
-                    snippets.append(context)
-        if snippets:
-            contact_bullets.append(f"- {phone}: reported as {snippets[0]}.")
-        else:
-            contact_bullets.append(f"- {phone}: linked to retrieved records.")
-        if len(contact_bullets) >= 4:
-            break
+    for phone, _ in summary.phones.most_common(5):
+        contact_bullets.append(f"- {phone}: Referenced in corroborating communication records.")
 
     vehicle_bullets: list[str] = []
-    for vehicle, _ in summary.vehicles.most_common(6):
-        contexts: list[str] = []
-        for text in texts:
-            if vehicle.upper().replace(" ", "") in _vehicle_query_normalized(text):
-                m = re.search(rf"(?i)([^.\n]{{0,95}}{re.escape(vehicle)}[^.\n]{{0,95}})", text)
-                if m:
-                    contexts.append(" ".join(m.group(1).split()))
-        if contexts:
-            vehicle_bullets.append(f"- {vehicle}: observed with {contexts[0]}.")
-        else:
-            vehicle_bullets.append(f"- {vehicle}: associated with retrieved records.")
-        if len(vehicle_bullets) >= 4:
+    for vehicle, _ in summary.vehicles.most_common(5):
+        vehicle_bullets.append(f"- {vehicle}: Mentioned across evidence linked to the subject profile.")
+
+    relationship_bullets: list[str] = []
+    subject_key = _normalize_person_name(subject)
+    for person, _ in summary.persons.most_common(12):
+        pkey = _normalize_person_name(person)
+        if not pkey or pkey == subject_key:
+            continue
+        relationship_bullets.append(f"- {person}: Appears in records associated with {subject}.")
+        if len(relationship_bullets) >= 4:
             break
 
-    person_parts = _person_name_parts(subject)
-    relationship_bullets: list[str] = []
-    associates = []
-    for person, _ in summary.persons.most_common(12):
-        p_parts = _person_name_parts(person)
-        if not p_parts:
-            continue
-        if " ".join(p_parts) == " ".join(person_parts):
-            continue
-        associates.append(person)
-    associates = _dedupe_preserve_order(associates)
-    if associates:
-        relationship_bullets.append(
-            f"- Associates: {', '.join(associates[:3])} were observed with or linked to {subject} in the same records."
-        )
-
-    date_hit = re.search(r"\b(20\d{2}[-/]\d{1,2}[-/]\d{1,2})\b", all_text)
-    meeting_hit = re.search(r"(?i)\b(meet(?:ing)?|handover|checkpoint|block\s+\d+)\b", all_text)
-    if date_hit or meeting_hit:
-        when = date_hit.group(1) if date_hit else "the retrieved period"
-        what = meeting_hit.group(1) if meeting_hit else "activity points"
-        relationship_bullets.append(f"- Observation: {subject} was reported as linked to {what} around {when}.")
-
-    if not relationship_bullets and linked_evidence:
-        relationship_bullets.append(
-            f"- Linked evidence: {len(linked_evidence)} records share identifiers with primary evidence for {subject}."
-        )
+    date_pattern = re.compile(r"\b(20\d{2}[-/]\d{1,2}[-/]\d{1,2})\b")
+    location_pattern = re.compile(
+        r"(?i)\b(block\s+\d+|checkpoint|warehouse|gate|meeting point|operational location)\b"
+    )
+    for r, _ in evidence_pool:
+        date_hit = date_pattern.search(r.text)
+        loc_hit = location_pattern.search(r.text)
+        if date_hit and loc_hit:
+            relationship_bullets.append(
+                f"- Observed at {loc_hit.group(1)} around {date_hit.group(1)} in primary-linked evidence."
+            )
+            break
 
     summary_line = (
-        f"{subject} is linked to {len(primary_evidence)} primary evidence record"
-        f"{'s' if len(primary_evidence) != 1 else ''}"
+        f"{subject} is assessed as a primary subject within the retrieved evidence set, "
+        "with corroborated identifiers and activity references requiring timeline validation."
     )
-    if linked_evidence:
-        summary_line += f" and {len(linked_evidence)} validated linked evidence record{'s' if len(linked_evidence) != 1 else ''}."
-    else:
-        summary_line += "."
-
     next_step = (
-        "Review the timeline and verify whether phone, vehicle, and meeting references align to one operational sequence."
+        "Review Activity Timeline to verify sequence consistency and confirm linkage between identifiers, movements, and meetings."
     )
-    if not vehicle_bullets and not contact_bullets:
-        next_step = "Review primary records for additional direct identifiers before expanding to broader semantic matches."
 
     sections = [f"Summary:\n{summary_line}"]
     if contact_bullets:
-        sections.append("Contact Numbers:\n" + "\n".join(contact_bullets))
+        sections.append("Contact Numbers:\n" + "\n".join(contact_bullets[:4]))
     if vehicle_bullets:
-        sections.append("Associated Vehicles:\n" + "\n".join(vehicle_bullets))
+        sections.append("Associated Vehicles:\n" + "\n".join(vehicle_bullets[:4]))
     if relationship_bullets:
-        sections.append("Key Relationships & Intelligence:\n" + "\n".join(relationship_bullets[:3]))
+        sections.append("Key Relationships & Intelligence:\n" + "\n".join(relationship_bullets[:4]))
     sections.append(f"Suggested Next Step:\n{next_step}")
 
     brief = "\n\n".join(sections)
     words = brief.split()
-    if len(words) > 180:
-        brief = " ".join(words[:180]).rstrip() + "..."
+    if len(words) > 220:
+        brief = " ".join(words[:220]).rstrip() + "..."
     return brief
 
 
@@ -667,7 +670,7 @@ def build_ai_summary(
     primary_evidence = primary_evidence or []
     linked_evidence = linked_evidence or []
     if _is_person_like_two_word_query(query) and has_exact_full_name_hit(ranked, query):
-        return build_intelligence_brief(summary, primary_evidence, linked_evidence, query)
+        return build_intelligence_summary(primary_evidence, linked_evidence, query)
 
     subject = _summary_subject(query, summary)
     n = len(ranked)
@@ -675,11 +678,7 @@ def build_ai_summary(
     vehicles = [name for name, _ in summary.vehicles.most_common(2)]
     phones = [name for name, _ in summary.phones.most_common(2)]
 
-    lead = (
-        f"The main subject is {subject}. "
-        f"This view is built from {n} evidence record{'s' if n != 1 else ''}, "
-        f"drawn from {mix}."
-    )
+    lead = f"The main subject is {subject}. Retrieved evidence includes {mix}."
 
     detail_parts: list[str] = []
     if vehicles:
@@ -704,8 +703,41 @@ def build_ai_summary(
     return lead + middle + closing
 
 
+def _render_login_gate() -> bool:
+    if "logged_in" not in st.session_state:
+        st.session_state.logged_in = False
+
+    if st.session_state.logged_in:
+        return True
+
+    st.title("Intelink Login")
+    st.caption("Demo login required to access the app.")
+
+    with st.form("login_form", clear_on_submit=True):
+        username = st.text_input("Username")
+        password = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("Login", type="primary")
+
+    if submitted:
+        if username == "Intel" and password == "iNtel":
+            st.session_state.logged_in = True
+            st.rerun()
+        else:
+            st.error("Invalid username or password.")
+    return False
+
+
 def main() -> None:
     st.set_page_config(page_title="Intel Search", layout="wide", initial_sidebar_state="expanded")
+    if not _render_login_gate():
+        return
+
+    if st.sidebar.button("Logout"):
+        st.session_state.logged_in = False
+        st.session_state.pop("active_query", None)
+        st.session_state.pop("qbox", None)
+        st.rerun()
+
     st.title("AI-powered intelligence search")
     st.caption("Semantic search with FAISS, OpenAI embeddings, and entity-aware analytics.")
 
