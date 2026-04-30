@@ -651,14 +651,14 @@ def build_ai_summary(
 
 
 def _render_login_gate() -> bool:
-    if "logged_in" not in st.session_state:
-        st.session_state.logged_in = False
+    if "authenticated" not in st.session_state:
+        st.session_state["authenticated"] = False
 
-    if st.session_state.logged_in:
+    if st.session_state["authenticated"]:
         return True
 
-    st.title("Intelink Login")
-    st.caption("Demo login required to access the app.")
+    st.title("Login")
+    st.caption("Please sign in to access the intelligence search dashboard.")
 
     with st.form("login_form", clear_on_submit=True):
         username = st.text_input("Username")
@@ -666,11 +666,11 @@ def _render_login_gate() -> bool:
         submitted = st.form_submit_button("Login", type="primary")
 
     if submitted:
-        if username == "Intel" and password == "iNtel":
-            st.session_state.logged_in = True
+        if username == "admin" and password == "admin123":
+            st.session_state["authenticated"] = True
             st.rerun()
         else:
-            st.error("Invalid username or password.")
+            st.error("Invalid username or password")
     return False
 
 
@@ -679,8 +679,9 @@ def main() -> None:
     if not _render_login_gate():
         return
 
+    st.sidebar.caption("Logged in as admin")
     if st.sidebar.button("Logout"):
-        st.session_state.logged_in = False
+        st.session_state.pop("authenticated", None)
         st.session_state.pop("active_query", None)
         st.session_state.pop("qbox", None)
         st.rerun()
