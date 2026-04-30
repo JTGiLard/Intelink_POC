@@ -645,9 +645,11 @@ def main() -> None:
     top_k = st.sidebar.slider("Results (FAISS top-K)", min_value=5, max_value=50, value=15)
     keyword_boost = st.sidebar.slider("Keyword boost for hybrid ranking", 0.0, 0.25, 0.12)
 
-    if not os.environ.get("OPENAI_API_KEY"):
-        st.error("Set `OPENAI_API_KEY` in a `.env` file or your environment.")
+    api_key = st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        st.error("OPENAI_API_KEY not set")
         st.stop()
+    os.environ["OPENAI_API_KEY"] = api_key
 
     try:
         _ = get_spacy_ready()
