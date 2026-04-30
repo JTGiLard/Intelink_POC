@@ -651,22 +651,18 @@ def build_ai_summary(
 
 
 def _render_login_gate() -> bool:
-    st.write("DEBUG: login gate active")
     if "authenticated" not in st.session_state:
         st.session_state["authenticated"] = False
 
-    if st.session_state["authenticated"]:
+    if st.session_state["authenticated"] is True:
         return True
 
+    st.write("DEBUG: login gate active")
     st.title("Login")
-    st.caption("Please sign in to access the intelligence search dashboard.")
+    username = st.text_input("Username")
+    password = st.text_input("Password", type="password")
 
-    with st.form("login_form", clear_on_submit=True):
-        username = st.text_input("Username")
-        password = st.text_input("Password", type="password")
-        submitted = st.form_submit_button("Login", type="primary")
-
-    if submitted:
+    if st.button("Login"):
         if username == "admin" and password == "admin123":
             st.session_state["authenticated"] = True
             st.rerun()
@@ -682,6 +678,7 @@ def main() -> None:
     if not _render_login_gate():
         st.stop()
 
+    st.sidebar.write("AUTH DEBUG:", st.session_state.get("authenticated"))
     st.sidebar.caption("Logged in as admin")
     if st.sidebar.button("Logout"):
         st.session_state.pop("authenticated", None)
