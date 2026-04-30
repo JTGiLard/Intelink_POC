@@ -673,6 +673,13 @@ def _render_login_gate() -> bool:
 
 def main() -> None:
     st.set_page_config(page_title="Intel Search", layout="wide", initial_sidebar_state="expanded")
+    st.write("DEPLOY DEBUG: app.py commit 339b9f3 loaded")
+    st.write("AUTH DEBUG before gate:", st.session_state.get("authenticated"))
+
+    if st.query_params.get("reset") == "1":
+        st.session_state.clear()
+        st.query_params.clear()
+        st.rerun()
 
     # LOGIN GATE — MUST BE FIRST
     if not _render_login_gate():
