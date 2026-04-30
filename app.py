@@ -681,7 +681,6 @@ def main() -> None:
     if not _render_login_gate():
         st.stop()
 
-    st.sidebar.write("AUTH DEBUG:", st.session_state.get("authenticated"))
     st.sidebar.caption("Logged in as admin")
     if st.sidebar.button("Logout"):
         st.session_state.pop("authenticated", None)
@@ -820,7 +819,6 @@ def main() -> None:
     )
 
     st.subheader("AI Summary")
-    st.caption("DEBUG: using build_intelligence_summary v2")
     st.write(
         build_ai_summary(
             ranked,

@@ -599,7 +599,6 @@ def _render_login_gate() -> bool:
     if st.session_state["authenticated"] is True:
         return True
 
-    st.write("DEBUG: login gate active")
     st.title("Login")
     username = st.text_input("Username")
     password = st.text_input("Password", type="password")
@@ -616,9 +615,6 @@ def _render_login_gate() -> bool:
 
 def main() -> None:
     st.set_page_config(page_title="Intel Search", layout="wide", initial_sidebar_state="expanded")
-    st.write("DEPLOY DEBUG: app.py commit 339b9f3 loaded")
-    st.write("AUTH DEBUG before gate:", st.session_state.get("authenticated"))
-
     if st.query_params.get("reset") == "1":
         st.session_state.clear()
         st.query_params.clear()
@@ -627,7 +623,6 @@ def main() -> None:
     if not _render_login_gate():
         st.stop()
 
-    st.sidebar.write("AUTH DEBUG:", st.session_state.get("authenticated"))
     st.sidebar.caption("Logged in as admin")
     if st.sidebar.button("Logout"):
         st.session_state.pop("authenticated", None)
@@ -762,7 +757,6 @@ def main() -> None:
     )
 
     st.subheader("AI Summary")
-    st.caption("DEBUG: using build_intelligence_summary v2")
     st.write(
         build_ai_summary(
             ranked,
