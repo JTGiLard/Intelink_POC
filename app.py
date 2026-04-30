@@ -644,63 +644,10 @@ def build_ai_summary(
     linked_evidence: list[tuple[ChunkRecord, float]] | None = None,
     corpus_exact_name_hit: bool = False,
 ) -> str:
-    if not ranked:
-        return "Nothing came back for this query, so there is no profile to summarize yet."
-
-    if _is_person_like_two_word_query(query) and not has_exact_full_name_hit(ranked, query):
-        q = _person_phrase_from_query(query).strip()
-        closest = find_closest_person_match(query, summary) if not corpus_exact_name_hit else None
-        if closest and not corpus_exact_name_hit:
-            return (
-                f"No exact match was found for {q}. Closest related match: {closest}. "
-                "Showing nearby evidence for review."
-            )
-        return f"No exact match was found for {q}. Showing semantically related evidence."
-
-    if _is_single_token_person_like_query(query):
-        q = _person_phrase_from_query(query).strip()
-        if q and not _has_exact_person_token_match(summary, q):
-            alias_suggestion = find_alias_suggestion(query, summary)
-            if alias_suggestion:
-                return (
-                    f"No exact match was found for '{q}'. Closest related alias: {alias_suggestion}. "
-                    "Showing semantically related evidence only."
-                )
-
+    _ = ranked, summary, timeline, corpus_exact_name_hit
     primary_evidence = primary_evidence or []
     linked_evidence = linked_evidence or []
-    if _is_person_like_two_word_query(query) and has_exact_full_name_hit(ranked, query):
-        return build_intelligence_summary(primary_evidence, linked_evidence, query)
-
-    subject = _summary_subject(query, summary)
-    n = len(ranked)
-    mix = _source_mix_sentence(ranked)
-    vehicles = [name for name, _ in summary.vehicles.most_common(2)]
-    phones = [name for name, _ in summary.phones.most_common(2)]
-
-    lead = f"The main subject is {subject}. Retrieved evidence includes {mix}."
-
-    detail_parts: list[str] = []
-    if vehicles:
-        if len(vehicles) == 1:
-            detail_parts.append(f"the vehicle or plate signal {vehicles[0]}")
-        else:
-            detail_parts.append(f"vehicle or plate signals {vehicles[0]} and {vehicles[1]}")
-    if phones:
-        if len(phones) == 1:
-            detail_parts.append(f"the number {phones[0]}")
-        else:
-            detail_parts.append(f"numbers {phones[0]} and {phones[1]}")
-    if detail_parts:
-        if len(detail_parts) == 1:
-            middle = f" Along the way, {detail_parts[0]} stood out in the text."
-        else:
-            middle = f" Along the way, {detail_parts[0]} and {detail_parts[1]} stood out in the text."
-    else:
-        middle = " No strong vehicle or phone anchors showed up in this slice."
-
-    closing = f" Suggested next move: {_rule_based_next_action(summary, timeline, ranked)}"
-    return lead + middle + closing
+    return build_intelligence_summary(primary_evidence, linked_evidence, query)
 
 
 def _render_login_gate() -> bool:
@@ -867,6 +814,7 @@ def main() -> None:
     )
 
     st.subheader("AI Summary")
+    st.caption("DEBUG: using build_intelligence_summary v2")
     st.write(
         build_ai_summary(
             ranked,

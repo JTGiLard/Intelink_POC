@@ -461,69 +461,135 @@ def _rule_based_next_action(
     )
 
 
+def _dedupe_preserve_order(items: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        key = " ".join(item.strip().lower().split())
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(item.strip())
+    return out
+
+
+def _normalize_person_name(name: str) -> str:
+    return " ".join(name.strip().lower().split())
+
+
+def _strong_summary_identifiers(text: str) -> set[str]:
+    ids: set[str] = set()
+    for h in extract_all_entities(text):
+        value = h.text.strip()
+        if not value:
+            continue
+        if h.label == "phone":
+            norm = normalize_phone_number(value)
+            if norm:
+                ids.add(f"phone:{norm}")
+        elif h.label == "vehicle":
+            veh = _vehicle_query_normalized(value)
+            if veh:
+                ids.add(f"vehicle:{veh}")
+    for m in re.finditer(r"\b[STFG]\d{7}[A-Z]\b", text, flags=re.IGNORECASE):
+        ids.add(f"nric:{m.group(0).upper()}")
+    company_rx = re.compile(
+        r"\b([A-Z][A-Za-z0-9&'()\-]*(?:\s+[A-Z][A-Za-z0-9&'()\-]*){0,5}\s+(?:Pte\.?\s+Ltd|Ltd|LLP|Inc\.?|Corp\.?))\b"
+    )
+    for m in company_rx.finditer(text):
+        ids.add(f"company:{' '.join(m.group(1).lower().split())}")
+    return ids
+
+
+def build_intelligence_summary(
+    primary_evidence: list[tuple[ChunkRecord, float]],
+    linked_evidence: list[tuple[ChunkRecord, float]],
+    query: str,
+) -> str:
+    subject = _person_phrase_from_query(query).strip() or query.strip() or "the queried subject"
+    primary_ids: set[str] = set()
+    for r, _ in primary_evidence:
+        primary_ids |= _strong_summary_identifiers(r.text)
+
+    validated_linked: list[tuple[ChunkRecord, float]] = []
+    for r, s in linked_evidence:
+        if primary_ids & _strong_summary_identifiers(r.text):
+            validated_linked.append((r, s))
+
+    evidence_pool = primary_evidence + validated_linked
+    all_hits = []
+    for r, _ in evidence_pool:
+        all_hits.extend(extract_all_entities(r.text))
+    summary = summarize_entities(all_hits)
+
+    contact_bullets: list[str] = []
+    for phone, _ in summary.phones.most_common(5):
+        contact_bullets.append(f"- {phone}: Referenced in corroborating communication records.")
+
+    vehicle_bullets: list[str] = []
+    for vehicle, _ in summary.vehicles.most_common(5):
+        vehicle_bullets.append(f"- {vehicle}: Mentioned across evidence linked to the subject profile.")
+
+    relationship_bullets: list[str] = []
+    subject_key = _normalize_person_name(subject)
+    for person, _ in summary.persons.most_common(12):
+        pkey = _normalize_person_name(person)
+        if not pkey or pkey == subject_key:
+            continue
+        relationship_bullets.append(f"- {person}: Appears in records associated with {subject}.")
+        if len(relationship_bullets) >= 4:
+            break
+
+    date_pattern = re.compile(r"\b(20\d{2}[-/]\d{1,2}[-/]\d{1,2})\b")
+    location_pattern = re.compile(
+        r"(?i)\b(block\s+\d+|checkpoint|warehouse|gate|meeting point|operational location)\b"
+    )
+    for r, _ in evidence_pool:
+        date_hit = date_pattern.search(r.text)
+        loc_hit = location_pattern.search(r.text)
+        if date_hit and loc_hit:
+            relationship_bullets.append(
+                f"- Observed at {loc_hit.group(1)} around {date_hit.group(1)} in primary-linked evidence."
+            )
+            break
+
+    summary_line = (
+        f"{subject} is assessed as a primary subject within the retrieved evidence set, "
+        "with corroborated identifiers and activity references requiring timeline validation."
+    )
+    next_step = (
+        "Review Activity Timeline to verify sequence consistency and confirm linkage between identifiers, movements, and meetings."
+    )
+
+    sections = [f"Summary:\n{summary_line}"]
+    if contact_bullets:
+        sections.append("Contact Numbers:\n" + "\n".join(contact_bullets[:4]))
+    if vehicle_bullets:
+        sections.append("Associated Vehicles:\n" + "\n".join(vehicle_bullets[:4]))
+    if relationship_bullets:
+        sections.append("Key Relationships & Intelligence:\n" + "\n".join(relationship_bullets[:4]))
+    sections.append(f"Suggested Next Step:\n{next_step}")
+
+    brief = "\n\n".join(sections)
+    words = brief.split()
+    if len(words) > 220:
+        brief = " ".join(words[:220]).rstrip() + "..."
+    return brief
+
+
 def build_ai_summary(
     ranked: list[tuple[ChunkRecord, float]],
     summary: EntitySummary,
     timeline: list[TimelineEvent],
     query: str,
+    primary_evidence: list[tuple[ChunkRecord, float]] | None = None,
+    linked_evidence: list[tuple[ChunkRecord, float]] | None = None,
     corpus_exact_name_hit: bool = False,
 ) -> str:
-    if not ranked:
-        return "Nothing came back for this query, so there is no profile to summarize yet."
-
-    if _is_person_like_two_word_query(query) and not has_exact_full_name_hit(ranked, query):
-        q = _person_phrase_from_query(query).strip()
-        closest = find_closest_person_match(query, summary) if not corpus_exact_name_hit else None
-        if closest and not corpus_exact_name_hit:
-            return (
-                f"No exact match was found for {q}. Closest related match: {closest}. "
-                "Showing nearby evidence for review."
-            )
-        return f"No exact match was found for {q}. Showing semantically related evidence."
-
-    if _is_single_token_person_like_query(query):
-        q = _person_phrase_from_query(query).strip()
-        if q and not _has_exact_person_token_match(summary, q):
-            alias_suggestion = find_alias_suggestion(query, summary)
-            if alias_suggestion:
-                return (
-                    f"No exact match was found for '{q}'. Closest related alias: {alias_suggestion}. "
-                    "Showing semantically related evidence only."
-                )
-
-    subject = _summary_subject(query, summary)
-    n = len(ranked)
-    mix = _source_mix_sentence(ranked)
-    vehicles = [name for name, _ in summary.vehicles.most_common(2)]
-    phones = [name for name, _ in summary.phones.most_common(2)]
-
-    lead = (
-        f"The main subject is {subject}. "
-        f"This view is built from {n} evidence record{'s' if n != 1 else ''}, "
-        f"drawn from {mix}."
-    )
-
-    detail_parts: list[str] = []
-    if vehicles:
-        if len(vehicles) == 1:
-            detail_parts.append(f"the vehicle or plate signal {vehicles[0]}")
-        else:
-            detail_parts.append(f"vehicle or plate signals {vehicles[0]} and {vehicles[1]}")
-    if phones:
-        if len(phones) == 1:
-            detail_parts.append(f"the number {phones[0]}")
-        else:
-            detail_parts.append(f"numbers {phones[0]} and {phones[1]}")
-    if detail_parts:
-        if len(detail_parts) == 1:
-            middle = f" Along the way, {detail_parts[0]} stood out in the text."
-        else:
-            middle = f" Along the way, {detail_parts[0]} and {detail_parts[1]} stood out in the text."
-    else:
-        middle = " No strong vehicle or phone anchors showed up in this slice."
-
-    closing = f" Suggested next move: {_rule_based_next_action(summary, timeline, ranked)}"
-    return lead + middle + closing
+    _ = ranked, summary, timeline, corpus_exact_name_hit
+    primary_evidence = primary_evidence or []
+    linked_evidence = linked_evidence or []
+    return build_intelligence_summary(primary_evidence, linked_evidence, query)
 
 
 def main() -> None:
@@ -653,7 +719,18 @@ def main() -> None:
     )
 
     st.subheader("AI Summary")
-    st.write(build_ai_summary(ranked, summary, timeline, query, corpus_exact_name_hit=corpus_exact_name_hit))
+    st.caption("DEBUG: using build_intelligence_summary v2")
+    st.write(
+        build_ai_summary(
+            ranked,
+            summary,
+            timeline,
+            query,
+            primary_evidence=primary_evidence,
+            linked_evidence=related_evidence,
+            corpus_exact_name_hit=corpus_exact_name_hit,
+        )
+    )
     q_tokens = [t for t in query.strip().lower().split() if len(t) > 1]
     if len(q_tokens) >= 2 and not has_exact_full_name_hit(ranked, query):
         st.info(

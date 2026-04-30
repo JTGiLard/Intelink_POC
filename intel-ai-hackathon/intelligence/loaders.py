@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import email
 import re
+from email.header import decode_header, make_header
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -26,6 +27,30 @@ _WHATSAPP_LINE = re.compile(
 )
 
 
+def _decode_bytes_prefer(raw_bytes: bytes) -> str:
+    for enc in ("utf-8-sig", "utf-8", "cp1252", "latin-1"):
+        try:
+            return raw_bytes.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return raw_bytes.decode("utf-8", errors="replace")
+
+
+def _decode_part_payload(part) -> str:
+    payload = part.get_payload(decode=True)
+    if isinstance(payload, bytes):
+        charset = part.get_content_charset()
+        if charset:
+            try:
+                return payload.decode(charset)
+            except (LookupError, UnicodeDecodeError):
+                pass
+        return _decode_bytes_prefer(payload)
+    if isinstance(payload, str):
+        return payload
+    return ""
+
+
 def _parse_whatsapp_dt(date_part: str, time_part: str) -> datetime | None:
     for fmt in ("%d/%m/%Y %H:%M", "%d-%m-%Y %H:%M", "%d.%m.%Y %H:%M", "%m/%d/%Y %H:%M"):
         try:
@@ -36,7 +61,7 @@ def _parse_whatsapp_dt(date_part: str, time_part: str) -> datetime | None:
 
 
 def load_whatsapp(path: Path) -> LoadedDocument:
-    raw = path.read_text(encoding="utf-8", errors="replace")
+    raw = _decode_bytes_prefer(path.read_bytes())
     lines = raw.splitlines()
     first_dt: datetime | None = None
     normalized: list[str] = []
@@ -69,7 +94,11 @@ def load_email(path: Path) -> LoadedDocument:
     title: str
     try:
         msg = email.message_from_bytes(raw_bytes)
-        subj = msg.get("Subject", path.stem) or path.stem
+        subj_raw = msg.get("Subject", path.stem) or path.stem
+        try:
+            subj = str(make_header(decode_header(subj_raw)))
+        except Exception:
+            subj = str(subj_raw)
         date_hdr = msg.get("Date")
         if date_hdr:
             try:
@@ -81,21 +110,19 @@ def load_email(path: Path) -> LoadedDocument:
             for part in msg.walk():
                 ctype = part.get_content_type()
                 if ctype == "text/plain":
-                    payload = part.get_payload(decode=True)
-                    if isinstance(payload, bytes):
-                        body_parts.append(payload.decode("utf-8", errors="replace"))
+                    body = _decode_part_payload(part)
+                    if body:
+                        body_parts.append(body)
         else:
-            payload = msg.get_payload(decode=True)
-            if isinstance(payload, bytes):
-                body_parts.append(payload.decode("utf-8", errors="replace"))
-            elif isinstance(payload, str):
-                body_parts.append(payload)
+            body = _decode_part_payload(msg)
+            if body:
+                body_parts.append(body)
         text = "\n".join(body_parts) if body_parts else ""
         title = str(subj)
         if len(text.strip()) < 20 and msg.keys():
-            text = raw_bytes.decode("utf-8", errors="replace")
+            text = _decode_bytes_prefer(raw_bytes)
     except Exception:
-        text = raw_bytes.decode("utf-8", errors="replace")
+        text = _decode_bytes_prefer(raw_bytes)
         title = path.stem
     return LoadedDocument(
         doc_id=f"email:{path.name}",
@@ -112,7 +139,7 @@ def load_report(path: Path) -> LoadedDocument:
         doc = Document(path)
         text = "\n\n".join(p.text.strip() for p in doc.paragraphs if p.text.strip())
     else:
-        text = path.read_text(encoding="utf-8", errors="replace")
+        text = _decode_bytes_prefer(path.read_bytes())
     mtime = datetime.fromtimestamp(path.stat().st_mtime)
     return LoadedDocument(
         doc_id=f"report:{path.name}",
