@@ -651,6 +651,7 @@ def build_ai_summary(
 
 
 def _render_login_gate() -> bool:
+    st.write("DEBUG: login gate active")
     if "authenticated" not in st.session_state:
         st.session_state["authenticated"] = False
 
@@ -676,8 +677,10 @@ def _render_login_gate() -> bool:
 
 def main() -> None:
     st.set_page_config(page_title="Intel Search", layout="wide", initial_sidebar_state="expanded")
+
+    # LOGIN GATE — MUST BE FIRST
     if not _render_login_gate():
-        return
+        st.stop()
 
     st.sidebar.caption("Logged in as admin")
     if st.sidebar.button("Logout"):
