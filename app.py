@@ -11,6 +11,10 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 from dotenv import load_dotenv
+try:
+    from rapidfuzz import fuzz
+except Exception:  # pragma: no cover - optional dependency
+    fuzz = None
 
 from intelligence.chunking import chunk_document
 from intelligence.embeddings import embed_texts
@@ -457,6 +461,35 @@ def _person_name_parts(name: str) -> list[str]:
     return [p.strip().lower() for p in re.split(r"\s+", name.strip()) if p.strip()]
 
 
+def _fuzzy_person_similarity(query_name: str, candidate_name: str) -> float:
+    q = " ".join(query_name.strip().lower().split())
+    c = " ".join(candidate_name.strip().lower().split())
+    if not q or not c:
+        return 0.0
+    if fuzz is not None:
+        # Blend direct ratio and token-aware ratio for robust spelling variation handling.
+        return max(float(fuzz.ratio(q, c)), float(fuzz.token_sort_ratio(q, c))) / 100.0
+    return SequenceMatcher(None, q, c).ratio()
+
+
+def get_closest_person_matches(
+    query: str,
+    person_counter: Counter[str],
+    limit: int = 3,
+) -> list[tuple[str, int, float]]:
+    q = _person_phrase_from_query(query).strip()
+    if not q or not person_counter:
+        return []
+    ranked: list[tuple[str, int, float]] = []
+    for name, mention_count in person_counter.items():
+        if not name.strip():
+            continue
+        sim = _fuzzy_person_similarity(q, name)
+        ranked.append((name, mention_count, sim))
+    ranked.sort(key=lambda item: (-item[2], -item[1], item[0].lower()))
+    return ranked[: max(1, limit)]
+
+
 def corpus_distinct_person_names_with_token(records: list[ChunkRecord], token: str) -> frozenset[str]:
     """Distinct extracted person strings where ``token`` matches a whole name part (case-insensitive)."""
     tk = token.strip().lower()
@@ -709,10 +742,15 @@ def build_intelligence_summary(
 
         sections = [f"Summary:\n{summary_line}"]
         closest_lines = [
-            f"- {name} ({cnt} mentions)" for name, cnt in summary.persons.most_common(3) if name.strip()
+            f"- {name} ({cnt} mentions, similarity {sim:.2f})"
+            for name, cnt, sim in get_closest_person_matches(query, summary.persons, limit=3)
+            if name.strip()
         ]
         if closest_lines:
-            sections.append("Closest matches:\n" + "\n".join(closest_lines))
+            sections.append(
+                "Closest matches (possible spelling match; closest-match context only, not confirmed as the same person):\n"
+                + "\n".join(closest_lines)
+            )
         if contact_bullets:
             sections.append(
                 "Related context — contact signals (not confirmed for this query):\n"
@@ -758,6 +796,34 @@ def build_ai_summary(
         summary_evidence=summary_evidence,
         cluster_label=cluster_label,
     )
+
+
+def _chunk_mentions_selected_name(text: str, selected_name: str | None) -> bool:
+    if not selected_name:
+        return True
+    selected_norm = " ".join(selected_name.strip().lower().split())
+    if not selected_norm:
+        return True
+    return selected_norm in " ".join(text.lower().split())
+
+
+def _filter_ranked_for_selected_name(
+    ranked: list[tuple[ChunkRecord, float]],
+    selected_name: str | None,
+) -> list[tuple[ChunkRecord, float]]:
+    if not selected_name:
+        return list(ranked)
+    return [(r, s) for r, s in ranked if _chunk_mentions_selected_name(r.text, selected_name)]
+
+
+def _filter_edges_for_selected_name(
+    edges: list[tuple[str, str, float, str, str]],
+    selected_name: str | None,
+) -> list[tuple[str, str, float, str, str]]:
+    if not selected_name:
+        return list(edges)
+    selected_key = f"person:{' '.join(selected_name.strip().lower().split())}"
+    return [e for e in edges if e[0].lower() == selected_key or e[1].lower() == selected_key]
 
 
 def _render_login_gate() -> bool:
@@ -932,25 +998,55 @@ def main() -> None:
         store.records, query_person_phrase
     )
 
+    person_query = _is_person_like_two_word_query(query)
+    exact_person_match = person_query and has_exact_match(query, primary_evidence)
+    closest_person_matches = (
+        get_closest_person_matches(query, summary.persons, limit=3)
+        if person_query and not exact_person_match
+        else []
+    )
+    selected_analysis_name = (
+        query
+        if exact_person_match
+        else (closest_person_matches[0][0] if closest_person_matches else None)
+    )
+
+    analysis_ranked = _filter_ranked_for_selected_name(ranked, selected_analysis_name)
+    if selected_analysis_name and analysis_ranked:
+        summary, edges, timeline = aggregate_dashboard(analysis_ranked, query)
+        primary_evidence = _filter_ranked_for_selected_name(primary_evidence, selected_analysis_name)
+        related_evidence = _filter_ranked_for_selected_name(related_evidence, selected_analysis_name)
+    elif selected_analysis_name:
+        primary_evidence = []
+        related_evidence = []
+        summary = EntitySummary()
+        edges = _filter_edges_for_selected_name(edges_semantic, selected_analysis_name)
+        timeline = []
+
     summary_evidence_sel: list[tuple[ChunkRecord, float]] | None = None
     cluster_label_sel: str | None = None
-    if _is_person_like_two_word_query(query) and identity_result.clusters:
+    filtered_identity_clusters = (
+        [cl for cl in identity_result.clusters if not selected_analysis_name or any(_chunk_mentions_selected_name(r.text, selected_analysis_name) for r, _ in cl.chunks)]
+        if person_query
+        else []
+    )
+    if person_query and filtered_identity_clusters:
         labels = [
             f"{cluster_summary_label(c)} — {c.confidence} — {len(c.chunks)} snippet(s)"
-            for c in identity_result.clusters
+            for c in filtered_identity_clusters
         ]
         pick_key = f"idcl_scope:{query}"
-        n_cl = len(identity_result.clusters)
+        n_cl = len(filtered_identity_clusters)
         cur = st.session_state.get(pick_key)
         if not isinstance(cur, int) or cur < 0 or cur >= n_cl:
-            st.session_state[pick_key] = pick_default_cluster_index(identity_result.clusters)
+            st.session_state[pick_key] = pick_default_cluster_index(filtered_identity_clusters)
         pick_ix = st.selectbox(
             "AI Summary uses this identity cluster only (confirmed co-mentions).",
             list(range(len(labels))),
             format_func=lambda i: labels[i],
             key=pick_key,
         )
-        chosen = identity_result.clusters[pick_ix]
+        chosen = filtered_identity_clusters[pick_ix]
         summary_evidence_sel = chosen.chunks
         cluster_label_sel = cluster_summary_label(chosen)
 
@@ -968,12 +1064,19 @@ def main() -> None:
             cluster_label=cluster_label_sel,
         )
     )
+    if person_query and not exact_person_match and selected_analysis_name:
+        st.warning(
+            f"No exact match for '{query}'. Showing closest-match context for '{selected_analysis_name}' only."
+        )
+        st.caption(
+            "This is possible spelling match context and is not confirmed as the same person."
+        )
     q_tokens = [t for t in query.strip().lower().split() if len(t) > 1]
     if len(q_tokens) >= 2 and not has_exact_match(query, primary_evidence):
-        top_person = summary.persons.most_common(1)[0][0] if summary.persons else None
+        top_person = closest_person_matches[0][0] if closest_person_matches else None
         if top_person:
             st.info(
-                f"A close match was found (e.g. '{top_person}'), but no exact match for your query."
+                f"A possible spelling match was found (e.g. '{top_person}'); showing closest-match context only and not confirmed as the same person."
             )
         else:
             st.info(
@@ -1010,11 +1113,11 @@ def main() -> None:
         )
         if not _is_person_like_two_word_query(query):
             st.info("Identity clustering runs for full-name queries (two name tokens, e.g. **John Tan**).")
-        elif not identity_result.clusters:
+        elif not filtered_identity_clusters:
             st.write("No same-name mentions found in retrieved snippets for this query phrase.")
         else:
             st.markdown(f"### Possible identities for **{identity_result.query_phrase}**")
-            for cl in identity_result.clusters:
+            for cl in filtered_identity_clusters:
                 title = "Unlinked mention" if cl.is_unlinked else f"Identity Cluster {cl.display_index}"
                 st.markdown(f"#### {title}")
                 st.markdown("**Evidence identifiers**")
