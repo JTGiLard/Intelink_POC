@@ -162,6 +162,17 @@ def has_exact_full_name_hit(ranked: list[tuple[ChunkRecord, float]], query: str)
     return any(phrase in r.text.lower() for r, _ in ranked)
 
 
+def has_exact_match(query: str, primary_evidence: list[tuple[ChunkRecord, float]]) -> bool:
+    """True when the full query string (case-insensitive) appears in primary evidence text."""
+    q = query.strip().lower()
+    if not q:
+        return False
+    for r, _ in primary_evidence:
+        if q in r.text.lower():
+            return True
+    return False
+
+
 def corpus_has_exact_phrase(records: list[ChunkRecord], phrase: str) -> bool:
     q = " ".join(phrase.strip().lower().split())
     if not q:
@@ -505,70 +516,154 @@ def build_intelligence_summary(
     primary_evidence: list[tuple[ChunkRecord, float]],
     linked_evidence: list[tuple[ChunkRecord, float]],
     query: str,
+    *,
+    summary_evidence: list[tuple[ChunkRecord, float]] | None = None,
+    cluster_label: str | None = None,
 ) -> str:
     subject = _person_phrase_from_query(query).strip() or query.strip() or "the queried subject"
-    primary_ids: set[str] = set()
-    for r, _ in primary_evidence:
-        primary_ids |= _strong_summary_identifiers(r.text)
+    scope_prefix = ""
+    if cluster_label:
+        scope_prefix = (
+            f"Scope: {cluster_label}. Only identifiers and associates from this cluster's snippets are asserted; "
+            "other same-name mentions may be different people. "
+        )
 
-    validated_linked: list[tuple[ChunkRecord, float]] = []
-    for r, s in linked_evidence:
-        if primary_ids & _strong_summary_identifiers(r.text):
-            validated_linked.append((r, s))
+    if summary_evidence is not None:
+        if not summary_evidence:
+            line = "No snippets in the selected identity cluster."
+            return f"Summary:\n{scope_prefix}{line}" if scope_prefix else f"Summary:\n{line}"
+        evidence_pool = list(summary_evidence)
+        exact_match = has_exact_match(query, evidence_pool)
+    else:
+        exact_match = has_exact_match(query, primary_evidence)
+        primary_ids: set[str] = set()
+        for r, _ in primary_evidence:
+            primary_ids |= _strong_summary_identifiers(r.text)
 
-    evidence_pool = primary_evidence + validated_linked
+        validated_linked: list[tuple[ChunkRecord, float]] = []
+        for r, s in linked_evidence:
+            if primary_ids & _strong_summary_identifiers(r.text):
+                validated_linked.append((r, s))
+
+        evidence_pool = primary_evidence + validated_linked
     all_hits = []
     for r, _ in evidence_pool:
         all_hits.extend(extract_all_entities(r.text))
     summary = summarize_entities(all_hits)
 
-    contact_bullets: list[str] = []
-    for phone, _ in summary.phones.most_common(5):
-        contact_bullets.append(f"- {phone}: Referenced in corroborating communication records.")
+    if exact_match:
+        contact_bullets: list[str] = []
+        for phone, _ in summary.phones.most_common(5):
+            contact_bullets.append(f"- {phone}: Referenced in corroborating communication records.")
 
-    vehicle_bullets: list[str] = []
-    for vehicle, _ in summary.vehicles.most_common(5):
-        vehicle_bullets.append(f"- {vehicle}: Mentioned across evidence linked to the subject profile.")
+        vehicle_bullets: list[str] = []
+        for vehicle, _ in summary.vehicles.most_common(5):
+            vehicle_bullets.append(f"- {vehicle}: Mentioned across evidence linked to the subject profile.")
 
-    relationship_bullets: list[str] = []
-    subject_key = _normalize_person_name(subject)
-    for person, _ in summary.persons.most_common(12):
-        pkey = _normalize_person_name(person)
-        if not pkey or pkey == subject_key:
-            continue
-        relationship_bullets.append(f"- {person}: Appears in records associated with {subject}.")
-        if len(relationship_bullets) >= 4:
-            break
+        relationship_bullets: list[str] = []
+        subject_key = _normalize_person_name(subject)
+        for person, _ in summary.persons.most_common(12):
+            pkey = _normalize_person_name(person)
+            if not pkey or pkey == subject_key:
+                continue
+            relationship_bullets.append(f"- {person}: Appears in records associated with {subject}.")
+            if len(relationship_bullets) >= 4:
+                break
 
-    date_pattern = re.compile(r"\b(20\d{2}[-/]\d{1,2}[-/]\d{1,2})\b")
-    location_pattern = re.compile(
-        r"(?i)\b(block\s+\d+|checkpoint|warehouse|gate|meeting point|operational location)\b"
-    )
-    for r, _ in evidence_pool:
-        date_hit = date_pattern.search(r.text)
-        loc_hit = location_pattern.search(r.text)
-        if date_hit and loc_hit:
-            relationship_bullets.append(
-                f"- Observed at {loc_hit.group(1)} around {date_hit.group(1)} in primary-linked evidence."
+        date_pattern = re.compile(r"\b(20\d{2}[-/]\d{1,2}[-/]\d{1,2})\b")
+        location_pattern = re.compile(
+            r"(?i)\b(block\s+\d+|checkpoint|warehouse|gate|meeting point|operational location)\b"
+        )
+        for r, _ in evidence_pool:
+            date_hit = date_pattern.search(r.text)
+            loc_hit = location_pattern.search(r.text)
+            if date_hit and loc_hit:
+                relationship_bullets.append(
+                    f"- Observed at {loc_hit.group(1)} around {date_hit.group(1)} in primary-linked evidence."
+                )
+                break
+
+        summary_line = (
+            f"{scope_prefix}{subject} is assessed as a primary subject within the retrieved evidence set, "
+            "with corroborated identifiers and activity references requiring timeline validation."
+        )
+        next_step = (
+            "Review Activity Timeline to verify sequence consistency and confirm linkage between identifiers, movements, and meetings."
+        )
+
+        sections = [f"Summary:\n{summary_line}"]
+        if contact_bullets:
+            sections.append("Contact Numbers:\n" + "\n".join(contact_bullets[:4]))
+        if vehicle_bullets:
+            sections.append("Associated Vehicles:\n" + "\n".join(vehicle_bullets[:4]))
+        if relationship_bullets:
+            sections.append("Key Relationships & Intelligence:\n" + "\n".join(relationship_bullets[:4]))
+        sections.append(f"Suggested Next Step:\n{next_step}")
+    else:
+        contact_bullets = []
+        for phone, cnt in summary.phones.most_common(5):
+            contact_bullets.append(
+                f"- {phone}: Referenced in related retrieved evidence ({cnt} mentions; not confirmed for this exact query)."
             )
-            break
 
-    summary_line = (
-        f"{subject} is assessed as a primary subject within the retrieved evidence set, "
-        "with corroborated identifiers and activity references requiring timeline validation."
-    )
-    next_step = (
-        "Review Activity Timeline to verify sequence consistency and confirm linkage between identifiers, movements, and meetings."
-    )
+        vehicle_bullets = []
+        for vehicle, cnt in summary.vehicles.most_common(5):
+            vehicle_bullets.append(
+                f"- {vehicle}: Mentioned in related retrieved evidence ({cnt} mentions; not confirmed for this exact query)."
+            )
 
-    sections = [f"Summary:\n{summary_line}"]
-    if contact_bullets:
-        sections.append("Contact Numbers:\n" + "\n".join(contact_bullets[:4]))
-    if vehicle_bullets:
-        sections.append("Associated Vehicles:\n" + "\n".join(vehicle_bullets[:4]))
-    if relationship_bullets:
-        sections.append("Key Relationships & Intelligence:\n" + "\n".join(relationship_bullets[:4]))
-    sections.append(f"Suggested Next Step:\n{next_step}")
+        relationship_bullets = []
+        subject_key = _normalize_person_name(subject)
+        for person, cnt in summary.persons.most_common(12):
+            pkey = _normalize_person_name(person)
+            if not pkey or pkey == subject_key:
+                continue
+            relationship_bullets.append(
+                f"- {person}: Mentioned in related retrieved evidence ({cnt} mentions; not confirmed as the queried subject)."
+            )
+            if len(relationship_bullets) >= 4:
+                break
+
+        date_pattern = re.compile(r"\b(20\d{2}[-/]\d{1,2}[-/]\d{1,2})\b")
+        location_pattern = re.compile(
+            r"(?i)\b(block\s+\d+|checkpoint|warehouse|gate|meeting point|operational location)\b"
+        )
+        for r, _ in evidence_pool:
+            date_hit = date_pattern.search(r.text)
+            loc_hit = location_pattern.search(r.text)
+            if date_hit and loc_hit:
+                relationship_bullets.append(
+                    f"- Observed at {loc_hit.group(1)} around {date_hit.group(1)} in related retrieved evidence (not query-confirmed)."
+                )
+                break
+
+        summary_line = f"{scope_prefix}No confirmed primary subject found for exact query '{query}'."
+        next_step = (
+            "Refine query (e.g. correct spelling) or inspect Entity Profile for closest matches."
+        )
+
+        sections = [f"Summary:\n{summary_line}"]
+        closest_lines = [
+            f"- {name} ({cnt} mentions)" for name, cnt in summary.persons.most_common(3) if name.strip()
+        ]
+        if closest_lines:
+            sections.append("Closest matches:\n" + "\n".join(closest_lines))
+        if contact_bullets:
+            sections.append(
+                "Related context — contact signals (not confirmed for this query):\n"
+                + "\n".join(contact_bullets[:4])
+            )
+        if vehicle_bullets:
+            sections.append(
+                "Related context — vehicle / plate signals (not confirmed for this query):\n"
+                + "\n".join(vehicle_bullets[:4])
+            )
+        if relationship_bullets:
+            sections.append(
+                "Related context — entities & intelligence (not confirmed for this query):\n"
+                + "\n".join(relationship_bullets[:4])
+            )
+        sections.append(f"Suggested Next Step:\n{next_step}")
 
     brief = "\n\n".join(sections)
     words = brief.split()
@@ -585,11 +680,19 @@ def build_ai_summary(
     primary_evidence: list[tuple[ChunkRecord, float]] | None = None,
     linked_evidence: list[tuple[ChunkRecord, float]] | None = None,
     corpus_exact_name_hit: bool = False,
+    summary_evidence: list[tuple[ChunkRecord, float]] | None = None,
+    cluster_label: str | None = None,
 ) -> str:
     _ = ranked, summary, timeline, corpus_exact_name_hit
     primary_evidence = primary_evidence or []
     linked_evidence = linked_evidence or []
-    return build_intelligence_summary(primary_evidence, linked_evidence, query)
+    return build_intelligence_summary(
+        primary_evidence,
+        linked_evidence,
+        query,
+        summary_evidence=summary_evidence,
+        cluster_label=cluster_label,
+    )
 
 
 def _render_login_gate() -> bool:
@@ -769,11 +872,17 @@ def main() -> None:
         )
     )
     q_tokens = [t for t in query.strip().lower().split() if len(t) > 1]
-    if len(q_tokens) >= 2 and not has_exact_full_name_hit(ranked, query):
-        st.info(
-            "No evidence snippet contains an exact full-name match for your query; "
-            "ranked results may still include partial mentions or similarly named people."
-        )
+    if len(q_tokens) >= 2 and not has_exact_match(query, primary_evidence):
+        top_person = summary.persons.most_common(1)[0][0] if summary.persons else None
+        if top_person:
+            st.info(
+                f"A close match was found (e.g. '{top_person}'), but no exact match for your query."
+            )
+        else:
+            st.info(
+                "No exact match for your query in primary evidence; "
+                "ranked results may still include partial mentions or similarly named people."
+            )
 
     res_tab, ent_tab, rel_tab, time_tab = st.tabs(
         ["Evidence", "Entity Profile", "Link Analysis", "Activity Timeline"]
