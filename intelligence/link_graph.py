@@ -14,7 +14,7 @@ from intelligence.entities import normalize_phone_number
 from intelligence.index_store import ChunkRecord
 
 
-GRAPH_TOP_EDGES = 14
+GRAPH_TOP_EDGES = 20
 MAX_TOTAL_NODES = 16
 MAX_CASE_NODES = 4
 EDGE_LABEL_MAX = 6
@@ -429,12 +429,17 @@ def _sanitize_and_scale_positions(
     return scaled
 
 
+def _annotation_edge_key(node_a: str, node_b: str) -> tuple[str, str]:
+    return (node_a, node_b) if node_a <= node_b else (node_b, node_a)
+
+
 def build_entity_link_graph_figure(
     ranked: list[tuple[ChunkRecord, float]],
     edges: list[tuple[str, str, float, str, str]],
     query: str = "",
     person_centric: bool = False,
     anchor_person: str = "",
+    edge_semantic_labels: dict[tuple[str, str], str] | None = None,
 ) -> tuple[go.Figure | None, str]:
     if not edges:
         return None, ""
@@ -456,6 +461,12 @@ def build_entity_link_graph_figure(
         canonical_edges, plate_to_model, _suppressed_models = _collapse_vehicle_model_nodes(canonical_edges)
         canonical_edges = _dedupe_edges_keep_max_strength(canonical_edges)
         reduced_edges = sorted(canonical_edges, key=lambda e: -float(e[2]))[:GRAPH_TOP_EDGES]
+        plot_semantic_labels: dict[tuple[str, str], str] = {}
+        if edge_semantic_labels:
+            for a, b, *_rest in reduced_edges:
+                ek = _annotation_edge_key(a, b)
+                if ek in edge_semantic_labels:
+                    plot_semantic_labels[ek] = edge_semantic_labels[ek]
         nodes: set[str] = {a for a, _, _, _, _ in reduced_edges} | {b for _, b, _, _, _ in reduced_edges}
         if not nodes:
             return None, GRAPH_FAIL_MSG
@@ -556,7 +567,12 @@ def build_entity_link_graph_figure(
                 )
             )
 
-        label_edges = [e for e in reduced_edges if e[4] == "direct"]
+        label_edges: list[tuple[str, str, float, str, str]] = []
+        for e in reduced_edges:
+            a, b, _s, _lbl, lt = e
+            ek = _annotation_edge_key(a, b)
+            if lt == "direct" or (plot_semantic_labels and ek in plot_semantic_labels):
+                label_edges.append(e)
         label_edges.sort(key=lambda e: -float(e[2]))
         ann: list[dict[str, Any]] = []
         for a, b, _strength, _lbl, _lt in label_edges[:EDGE_LABEL_MAX]:
@@ -575,13 +591,15 @@ def build_entity_link_graph_figure(
                 textangle -= 180.0
             if textangle < -90:
                 textangle += 180.0
+            ek = _annotation_edge_key(a, b)
+            edge_text = plot_semantic_labels.get(ek) or _relationship_edge_label(a, b)
             ann.append(
                 {
                     "xref": "x",
                     "yref": "y",
                     "x": ox,
                     "y": oy,
-                    "text": _relationship_edge_label(a, b),
+                    "text": edge_text,
                     "showarrow": False,
                     "font": {"size": 10, "color": "#334155"},
                     "textangle": textangle,

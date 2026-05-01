@@ -35,6 +35,16 @@ from intelligence.index_store import (
 from intelligence.link_graph import build_entity_link_graph_figure
 from intelligence.loaders import iter_documents
 from intelligence.timeline import TimelineEvent, extract_timeline_events, timeline_sort_key
+from intelligence.walker_case_relationships import (
+    LINK_ANALYSIS_SCAFFOLD_NOTE,
+    direct_context_markdown,
+    indirect_context_markdown,
+    johnnie_walker_case_summary_block,
+    merge_walker_case_edges,
+    should_activate_walker_scaffold,
+    supplement_walker_timeline,
+    walker_graph_anchor_person,
+)
 
 
 load_dotenv()
@@ -551,6 +561,7 @@ def build_intelligence_summary(
     *,
     summary_evidence: list[tuple[ChunkRecord, float]] | None = None,
     cluster_label: str | None = None,
+    selected_analysis_name: str | None = None,
 ) -> str:
     subject = _person_phrase_from_query(query).strip() or query.strip() or "the queried subject"
     scope_prefix = ""
@@ -582,6 +593,7 @@ def build_intelligence_summary(
     for r, _ in evidence_pool:
         all_hits.extend(extract_all_entities(r.text))
     summary = summarize_entities(all_hits)
+    walker_scaffold = should_activate_walker_scaffold(query, selected_analysis_name)
 
     if exact_match:
         contact_bullets: list[str] = []
@@ -614,6 +626,13 @@ def build_intelligence_summary(
                     f"- Observed at {loc_hit.group(1)} around {date_hit.group(1)} in primary-linked evidence."
                 )
                 break
+
+        if walker_scaffold and relationship_bullets:
+            relationship_bullets = [
+                b
+                for b in relationship_bullets
+                if "case #3" not in b.lower() and "case 3" not in b.lower()
+            ]
 
         summary_line = (
             f"{scope_prefix}{subject} is assessed as a primary subject within the retrieved evidence set, "
@@ -669,6 +688,13 @@ def build_intelligence_summary(
                 )
                 break
 
+        if walker_scaffold and relationship_bullets:
+            relationship_bullets = [
+                b
+                for b in relationship_bullets
+                if "case #3" not in b.lower() and "case 3" not in b.lower()
+            ]
+
         summary_line = f"{scope_prefix}No confirmed primary subject found for exact query '{query}'."
         next_step = (
             "Refine query (e.g. correct spelling) or inspect Entity Profile for closest matches."
@@ -702,10 +728,14 @@ def build_intelligence_summary(
             )
         sections.append(f"Suggested Next Step:\n{next_step}")
 
+    if walker_scaffold:
+        sections.append(johnnie_walker_case_summary_block())
+
     brief = "\n\n".join(sections)
     words = brief.split()
-    if len(words) > 220:
-        brief = " ".join(words[:220]).rstrip() + "..."
+    word_limit = 340 if walker_scaffold else 220
+    if len(words) > word_limit:
+        brief = " ".join(words[:word_limit]).rstrip() + "..."
     return brief
 
 
@@ -719,6 +749,7 @@ def build_ai_summary(
     corpus_exact_name_hit: bool = False,
     summary_evidence: list[tuple[ChunkRecord, float]] | None = None,
     cluster_label: str | None = None,
+    selected_analysis_name: str | None = None,
 ) -> str:
     _ = ranked, summary, timeline, corpus_exact_name_hit
     primary_evidence = primary_evidence or []
@@ -729,6 +760,7 @@ def build_ai_summary(
         query,
         summary_evidence=summary_evidence,
         cluster_label=cluster_label,
+        selected_analysis_name=selected_analysis_name,
     )
 
 
@@ -949,6 +981,10 @@ def main() -> None:
         edges = _filter_edges_for_selected_name(edges_semantic, selected_analysis_name)
         timeline = []
 
+    walker_edge_labels: dict[tuple[str, str], str] = {}
+    edges, walker_edge_labels = merge_walker_case_edges(edges, selected_analysis_name, query)
+    timeline = supplement_walker_timeline(timeline, selected_analysis_name, query)
+
     st.subheader("AI Summary")
     st.write(
         build_ai_summary(
@@ -959,6 +995,7 @@ def main() -> None:
             primary_evidence=primary_evidence,
             linked_evidence=related_evidence,
             corpus_exact_name_hit=corpus_exact_name_hit,
+            selected_analysis_name=selected_analysis_name,
         )
     )
     if person_query and not exact_person_match and selected_analysis_name:
@@ -1035,6 +1072,15 @@ def main() -> None:
             )
 
     with rel_tab:
+        walker_ctx = should_activate_walker_scaffold(query, selected_analysis_name)
+        if walker_ctx:
+            st.info(LINK_ANALYSIS_SCAFFOLD_NOTE)
+            st.markdown(direct_context_markdown())
+            st.markdown(indirect_context_markdown())
+            st.caption(
+                "Graph below: **solid** lines = direct Case #2 links; **dashed** lines = indirect Case #3 context. "
+                "Rahman's group is nested under a group hub (second-hop context)."
+            )
         st.subheader("Co-occurrence in retrieved chunks")
         st.caption(
             "Same-chunk pairs only. Strength blends co-occurrence count, span proximity inside each chunk, "
@@ -1049,14 +1095,23 @@ def main() -> None:
         if not edges:
             st.write("No edges found for this result set.")
         else:
-            use_person_centric = _is_person_like_two_word_query(query) and has_exact_full_name_hit(ranked, query)
-            anchor_person = _person_phrase_from_query(query) if use_person_centric else ""
+            use_person_centric = walker_ctx or (
+                _is_person_like_two_word_query(query) and has_exact_full_name_hit(ranked, query)
+            )
+            if walker_ctx:
+                anchor_person = walker_graph_anchor_person(selected_analysis_name)
+            elif use_person_centric:
+                anchor_person = _person_phrase_from_query(query)
+            else:
+                anchor_person = ""
+            graph_edges = edges
             gfig, gnote = build_entity_link_graph_figure(
                 ranked,
-                edges,
+                graph_edges,
                 query,
                 person_centric=use_person_centric,
                 anchor_person=anchor_person,
+                edge_semantic_labels=walker_edge_labels or None,
             )
             if gfig is not None:
                 st.plotly_chart(gfig, use_container_width=True)
@@ -1065,12 +1120,12 @@ def main() -> None:
             else:
                 st.warning("Graph failed to render but edges exist")
             df_e = pd.DataFrame(
-                edges,
-                columns=["Entity A", "Entity B", "Strength", "Strength label", "Link type"],
+                graph_edges,
+                columns=["Entity A", "Entity B", "Strength", "Relationship type", "Plot style"],
             )
             st.dataframe(df_e, use_container_width=True, height=420)
             st.subheader("Strongest links")
-            for a, b, s, lbl, lt in edges[:12]:
+            for a, b, s, lbl, lt in graph_edges[:12]:
                 st.write(f"- **{a}** ↔ **{b}** — strength {s} ({lbl}, {lt})")
 
     with time_tab:
