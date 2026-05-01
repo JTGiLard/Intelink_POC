@@ -10,6 +10,9 @@ __pycache__/
 .idea/
 Thumbs.db
 Desktop.ini
+# Microsoft Office lock files (temporary while a document is open)
+~$*.docx
+~$*.doc
 AppData/
 Documents/
 Downloads/
