@@ -979,30 +979,115 @@ def apply_relationship_classification(
     return out
 
 
+def score_entity_resolution(alias_result: dict[str, object]) -> dict[str, object]:
+    """
+    Returns:
+    {
+      "score": int 0-100,
+      "level": "High" | "Medium" | "Low",
+      "drivers": list[str],
+      "penalties": list[str]
+    }
+    """
+    score = 0
+    drivers: list[str] = []
+    penalties: list[str] = []
+
+    explicit_alias_confirmed = bool(alias_result.get("explicit_alias_confirmed", False))
+    shared_identifiers = list(alias_result.get("shared_identifiers", []))
+    source_count = int(alias_result.get("source_count", 0) or 0)
+    ambiguous_phrases_found = list(alias_result.get("ambiguous_phrases_found", []))
+    name_similarity_only = bool(alias_result.get("name_similarity_only", False))
+    cooccurrence_only = bool(alias_result.get("cooccurrence_only", False))
+
+    if explicit_alias_confirmed:
+        score += 60
+        drivers.append("Explicit alias confirmation found")
+
+    if shared_identifiers:
+        shared_points = min(30, 15 * len(shared_identifiers))
+        score += shared_points
+        drivers.append(f"Shared identifiers ({', '.join(shared_identifiers[:4])})")
+
+    if source_count >= 2:
+        score += 10
+        drivers.append("Multiple independent evidence sources")
+
+    if cooccurrence_only:
+        score += 10
+        drivers.append("Co-occurrence support")
+
+    if ambiguous_phrases_found:
+        score -= 15
+        penalties.append("Ambiguous linkage wording present")
+
+    if name_similarity_only:
+        penalties.append("Name similarity without strong corroborators")
+        score = min(score, 40)
+
+    if explicit_alias_confirmed:
+        score = max(score, 85)
+
+    score = max(0, min(100, score))
+    if score >= 80:
+        level = "High"
+    elif score >= 50:
+        level = "Medium"
+    else:
+        level = "Low"
+
+    return {"score": score, "level": level, "drivers": drivers, "penalties": penalties}
+
+
+def render_confidence_bar(score: int, level: str) -> None:
+    st.progress(max(0.0, min(1.0, float(score) / 100.0)))
+    st.caption(f"Confidence: {level} ({score}/100)")
+
+
 def extract_alias_evidence(
     evidence_pool: list[tuple[ChunkRecord, float]],
     entity_a: str,
     entity_b: str,
-) -> tuple[list[str], list[str], str]:
+) -> dict[str, object]:
     alias_markers = [
         "refer to the same person",
-        "commonly refer to",
+        "confirms that",
+        "is the same person as",
+        "also known as",
+        "commonly referred to as",
         "simply as",
-        "alias",
-        "known as",
     ]
     explicit_lines: list[str] = []
     contextual_lines: list[str] = []
     shared_identifiers: set[str] = set()
+    explicit_alias_confirmed = False
+    confirmation_line = ""
+    ambiguous_phrases_found: list[str] = []
+    source_files: set[str] = set()
     a_l = entity_a.lower()
     b_l = entity_b.lower()
 
     for r, _ in evidence_pool:
         text_l = r.text.lower()
+        source_files.add(r.source_file)
         has_a = a_l in text_l
         has_b = b_l in text_l
+        if re.search(r"\b(may be linked|possibly linked|could be linked)\b", text_l, flags=re.IGNORECASE):
+            ambiguous_phrases_found.append(r.text.strip().replace("\n", " ")[:180])
         if any(marker in text_l for marker in alias_markers) and (has_a or has_b):
-            explicit_lines.append(r.text.strip().replace("\n", " ")[:260])
+            explicit_alias_confirmed = True
+            snippet = r.text.strip().replace("\n", " ")
+            explicit_lines.append(snippet[:260])
+            if not confirmation_line:
+                # Prefer the strongest explicit sentence to display in the summary.
+                split_sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", snippet) if s.strip()]
+                for sentence in split_sentences:
+                    sentence_l = sentence.lower()
+                    if any(marker in sentence_l for marker in alias_markers):
+                        confirmation_line = sentence
+                        break
+                if not confirmation_line:
+                    confirmation_line = snippet[:260]
         if has_a or has_b:
             if re.search(r"\b(?:vs1|gbc4432m|93445566|test company best|tan zong cai)\b", text_l, flags=re.IGNORECASE):
                 contextual_lines.append(r.text.strip().replace("\n", " ")[:260])
@@ -1015,14 +1100,29 @@ def extract_alias_evidence(
             if "vs1" in text_l:
                 shared_identifiers.add("VS1")
 
-    if explicit_lines:
+    if explicit_alias_confirmed:
         confidence = "High"
+        resolution = "Same person"
     elif len(shared_identifiers) >= 2:
         confidence = "Medium"
+        resolution = "Likely same"
     else:
         confidence = "Low"
+        resolution = "Inconclusive"
     support = _dedupe_preserve_order(contextual_lines + explicit_lines)
-    return _dedupe_preserve_order(explicit_lines), support, confidence
+    return {
+        "explicit_alias_confirmed": explicit_alias_confirmed,
+        "explicit_confirmation_sentences": _dedupe_preserve_order(explicit_lines),
+        "supporting_lines": support,
+        "shared_identifiers": sorted(shared_identifiers),
+        "source_count": len(source_files),
+        "ambiguous_phrases_found": _dedupe_preserve_order(ambiguous_phrases_found),
+        "name_similarity_only": (not explicit_alias_confirmed and not shared_identifiers and bool(support)),
+        "cooccurrence_only": (not explicit_alias_confirmed and not shared_identifiers and bool(support)),
+        "confidence": confidence,
+        "resolution": resolution,
+        "confirmation_line": confirmation_line,
+    }
 
 
 def build_intelligence_summary(
@@ -1149,12 +1249,19 @@ def build_intelligence_summary(
     if intent == "entity_resolution":
         left = entity_a.strip() or target_entity.strip() or "Entity A"
         right = entity_b.strip() or "Entity B"
-        explicit_alias, supporting_lines, confidence = extract_alias_evidence(evidence_pool, left, right)
-        if confidence == "High":
+        alias_result = extract_alias_evidence(evidence_pool, left, right)
+        explicit_alias_confirmed = bool(alias_result.get("explicit_alias_confirmed", False))
+        supporting_lines = list(alias_result.get("supporting_lines", []))
+        confirmation_line = str(alias_result.get("confirmation_line", "")).strip()
+        scoring = score_entity_resolution(alias_result)
+        confidence = str(scoring["level"])
+        score_value = int(scoring["score"])
+        drivers = list(scoring["drivers"])
+        if explicit_alias_confirmed:
             assessment = (
-                f"Resolution assessment:\nLikely yes. In the retrieved evidence, {left} and {right} are explicitly linked as aliases of Tan Zong Cai.\n\n"
+                f"Resolution assessment:\n{left} and {right} are assessed to refer to the same individual with high confidence.\n\n"
             )
-        elif confidence == "Medium":
+        elif str(alias_result.get("resolution", "")) == "Likely same":
             assessment = (
                 f"Resolution assessment:\nPossibly. The retrieved records suggest {left} and {right} may refer to the same person through shared identifiers and company context, but explicit alias wording is limited.\n\n"
             )
@@ -1172,15 +1279,21 @@ def build_intelligence_summary(
             support_lines.append("- Earlier records link Abang to VS1, lorry GBC4432M, and contact 93445566.")
         if not support_lines and supporting_lines:
             support_lines.append(f"- {supporting_lines[0]}")
+        if confirmation_line:
+            support_lines.append(f"- Explicit confirmation line: \"{confirmation_line}\"")
+        why_lines = [f"- {d}" for d in drivers] if drivers else ["- Evidence support is currently limited."]
 
         return (
             assessment
             + "Supporting evidence:\n"
             + ("\n".join(support_lines) if support_lines else "- Retrieved records do not yet provide strong alias confirmation lines.")
-            + f"\n\nConfidence:\n{confidence}, because "
+            + f"\n\nConfidence:\n{confidence} confidence — {score_value}/100"
+            + "\n\nWhy:\n"
+            + "\n".join(why_lines[:4])
+            + "\n\nConfidence rationale:\n"
             + (
-                "the alias relationship is explicitly stated in the company screening evidence."
-                if confidence == "High"
+                "the alias relationship is explicitly stated in source evidence."
+                if explicit_alias_confirmed
                 else "shared identifiers suggest linkage but direct alias wording requires stronger corroboration."
                 if confidence == "Medium"
                 else "name similarity or co-mention alone is not sufficient for reliable identity merging."
@@ -1707,6 +1820,10 @@ def main() -> None:
         cluster_label_sel = cluster_summary_label(chosen)
 
     st.subheader("AI Summary")
+    if intent == "entity_resolution":
+        alias_result_ui = extract_alias_evidence(primary_evidence + related_evidence, entity_a or target_entity, entity_b)
+        score_ui = score_entity_resolution(alias_result_ui)
+        render_confidence_bar(int(score_ui["score"]), str(score_ui["level"]))
     st.write(
         build_ai_summary(
             ranked,
@@ -1893,14 +2010,32 @@ def main() -> None:
             else:
                 st.warning("Graph failed to render but edges exist")
             df_e = pd.DataFrame(graph_edges, columns=["Entity A", "Entity B", "Strength", "Relationship type", "Plot style"])
+            parsed_conf: list[str] = []
+            parsed_basis: list[str] = []
+            conf_score: list[str] = []
+            for rel in df_e["Relationship type"].tolist():
+                parts = [p.strip() for p in str(rel).split("|")]
+                conf = parts[1] if len(parts) >= 2 else "N/A"
+                basis = parts[2] if len(parts) >= 3 else "N/A"
+                parsed_conf.append(conf)
+                parsed_basis.append(basis)
+                if conf == "Confirmed":
+                    conf_score.append("90")
+                elif conf == "Inferred":
+                    conf_score.append("65")
+                elif conf == "Weak":
+                    conf_score.append("30")
+                else:
+                    conf_score.append("N/A")
+            df_e["Confidence score"] = conf_score
+            df_e["Evidence basis"] = parsed_basis
             st.dataframe(df_e, use_container_width=True, height=420)
             if show_weak and weak_edges:
                 st.subheader("Weak co-occurrence links (optional)")
-                st.dataframe(
-                    pd.DataFrame(weak_edges, columns=["Entity A", "Entity B", "Strength", "Relationship type", "Plot style"]),
-                    use_container_width=True,
-                    height=240,
-                )
+                df_w = pd.DataFrame(weak_edges, columns=["Entity A", "Entity B", "Strength", "Relationship type", "Plot style"])
+                df_w["Confidence score"] = "N/A"
+                df_w["Evidence basis"] = "co-occurrence only"
+                st.dataframe(df_w, use_container_width=True, height=240)
             st.subheader("Strongest links")
             for a, b, s, lbl, lt in graph_edges[:12]:
                 st.write(f"- **{a}** ↔ **{b}** — strength {s} ({lbl}, {lt})")
