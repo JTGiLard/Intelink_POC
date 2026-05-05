@@ -1250,13 +1250,16 @@ def build_intelligence_summary(
         left = entity_a.strip() or target_entity.strip() or "Entity A"
         right = entity_b.strip() or "Entity B"
         alias_result = extract_alias_evidence(evidence_pool, left, right)
-        explicit_alias_confirmed = bool(alias_result.get("explicit_alias_confirmed", False))
-        supporting_lines = list(alias_result.get("supporting_lines", []))
+        explicit_alias = bool(alias_result.get("explicit_alias_confirmed", False))
+        confirmation_lines = list(alias_result.get("explicit_confirmation_sentences", []))
         confirmation_line = str(alias_result.get("confirmation_line", "")).strip()
-        scoring = score_entity_resolution(alias_result)
-        confidence = str(scoring["level"])
-        score_value = int(scoring["score"])
-        drivers = list(scoring["drivers"])
+        supporting_lines = list(alias_result.get("supporting_lines", []))
+        shared_identifiers = list(alias_result.get("shared_identifiers", []))
+        score_result = score_entity_resolution(alias_result)
+        score = int(score_result.get("score", 0))
+        level = str(score_result.get("level", "Low"))
+        drivers = list(score_result.get("drivers", []))
+        explicit_alias_confirmed = explicit_alias
         if explicit_alias_confirmed:
             assessment = (
                 f"Resolution assessment:\n{left} and {right} are assessed to refer to the same individual with high confidence.\n\n"
@@ -1273,6 +1276,8 @@ def build_intelligence_summary(
         support_lines: list[str] = []
         if explicit_alias:
             support_lines.append("- Co-workers commonly refer to Tan Zong Cai as \"Abang Tan\" and, during loading operations, simply as \"Abang\".")
+        if shared_identifiers:
+            support_lines.append(f"- Shared identifiers observed: {', '.join(shared_identifiers[:4])}.")
         if any("test company best" in line.lower() for line in supporting_lines):
             support_lines.append("- Company screening shows Test Company Best is registered under Tan Zong Cai.")
         if any(re.search(r"\b(vs1|gbc4432m|93445566)\b", line, flags=re.IGNORECASE) for line in supporting_lines):
@@ -1281,13 +1286,15 @@ def build_intelligence_summary(
             support_lines.append(f"- {supporting_lines[0]}")
         if confirmation_line:
             support_lines.append(f"- Explicit confirmation line: \"{confirmation_line}\"")
+        elif confirmation_lines:
+            support_lines.append(f"- Explicit confirmation line: \"{confirmation_lines[0]}\"")
         why_lines = [f"- {d}" for d in drivers] if drivers else ["- Evidence support is currently limited."]
 
         return (
             assessment
             + "Supporting evidence:\n"
             + ("\n".join(support_lines) if support_lines else "- Retrieved records do not yet provide strong alias confirmation lines.")
-            + f"\n\nConfidence:\n{confidence} confidence — {score_value}/100"
+            + f"\n\nConfidence:\n{level} confidence — {score}/100"
             + "\n\nWhy:\n"
             + "\n".join(why_lines[:4])
             + "\n\nConfidence rationale:\n"
@@ -1295,7 +1302,7 @@ def build_intelligence_summary(
                 "the alias relationship is explicitly stated in source evidence."
                 if explicit_alias_confirmed
                 else "shared identifiers suggest linkage but direct alias wording requires stronger corroboration."
-                if confidence == "Medium"
+                if level == "Medium"
                 else "name similarity or co-mention alone is not sufficient for reliable identity merging."
             )
             + "\n\nCaveat:\nThis conclusion applies within the retrieved evidence context and should be validated against official source records."
