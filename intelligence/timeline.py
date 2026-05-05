@@ -16,6 +16,16 @@ _ISO_LIKE = re.compile(
     r"\b(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(?::\d{2})?)\b",
 )
 
+_TEXTUAL_DATE = re.compile(
+    r"\b(\d{1,2})\s+"
+    r"(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|"
+    r"Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)"
+    r"\s+(\d{4})\b",
+    flags=re.IGNORECASE,
+)
+
+_NUMERIC_DATE = re.compile(r"\b(\d{1,2})/(\d{1,2})/(\d{4})\b")
+
 
 @dataclass
 class TimelineEvent:
@@ -94,6 +104,40 @@ def extract_timeline_events(record: ChunkRecord, max_events: int = 8) -> list[Ti
                 when=dt,
                 label="Timestamp",
                 detail=text[max(0, m.start() - 20) : m.end() + 80].replace("\n", " ")[:200],
+                chunk_id=record.chunk_id,
+            )
+        )
+
+    for m in _TEXTUAL_DATE.finditer(text):
+        raw = f"{m.group(1)} {m.group(2)} {m.group(3)}"
+        dt: datetime | None = None
+        for fmt in ("%d %b %Y", "%d %B %Y"):
+            try:
+                dt = datetime.strptime(raw, fmt)
+                break
+            except ValueError:
+                continue
+        if dt is None:
+            continue
+        events.append(
+            TimelineEvent(
+                when=dt,
+                label="Event date",
+                detail=text[max(0, m.start() - 30) : m.end() + 90].replace("\n", " ")[:200],
+                chunk_id=record.chunk_id,
+            )
+        )
+
+    for m in _NUMERIC_DATE.finditer(text):
+        try:
+            dt = datetime.strptime(f"{m.group(1)}/{m.group(2)}/{m.group(3)}", "%d/%m/%Y")
+        except ValueError:
+            continue
+        events.append(
+            TimelineEvent(
+                when=dt,
+                label="Event date",
+                detail=text[max(0, m.start() - 30) : m.end() + 90].replace("\n", " ")[:200],
                 chunk_id=record.chunk_id,
             )
         )

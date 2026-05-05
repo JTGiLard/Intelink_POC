@@ -32,6 +32,13 @@ from intelligence.index_store import (
     save_cache,
     try_load_cache,
 )
+from intelligence.identity_clusters import (
+    IdentityClusterResult,
+    build_person_identity_clusters,
+    cluster_summary_label,
+    format_linking_id_key,
+    pick_default_cluster_index,
+)
 from intelligence.link_graph import build_entity_link_graph_figure
 from intelligence.loaders import iter_documents
 from intelligence.timeline import TimelineEvent, extract_timeline_events, timeline_sort_key
@@ -63,6 +70,16 @@ def _cache_base() -> Path:
     return Path(__file__).resolve().parent / ".cache_index"
 
 
+ENTITY_OVERVIEW_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(r"^find\s+all\s+info\s+about\s+(.+?)\??$", flags=re.IGNORECASE),
+    re.compile(r"^show\s+everything\s+about\s+(.+?)\??$", flags=re.IGNORECASE),
+    re.compile(r"^build\s+intel\s+picture\s+for\s+(.+?)\??$", flags=re.IGNORECASE),
+    re.compile(r"^build\s+initial\s+intel\s+picture\s+for\s+(.+?)\??$", flags=re.IGNORECASE),
+    re.compile(r"^what\s+do\s+we\s+know\s+about\s+(.+?)\??$", flags=re.IGNORECASE),
+    re.compile(r"^who\s+is\s+(.+?)\??$", flags=re.IGNORECASE),
+    re.compile(r"^details\s+about\s+(.+?)\??$", flags=re.IGNORECASE),
+]
+
 OFFENCE_INTENT_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"^what\s+offence\s+was\s+(.+?)\s+involved\s+in\??$", flags=re.IGNORECASE),
     re.compile(r"^what\s+was\s+the\s+offence\s+about\s+for\s+(.+?)\??$", flags=re.IGNORECASE),
@@ -72,6 +89,28 @@ OFFENCE_INTENT_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"^what\s+did\s+(.+?)\s+do\??$", flags=re.IGNORECASE),
     re.compile(r"^why\s+was\s+(.+?)\s+arrested\??$", flags=re.IGNORECASE),
     re.compile(r"^case\s+against\s+(.+?)\??$", flags=re.IGNORECASE),
+]
+
+VEHICLE_LOOKUP_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(r"^which\s+vehicles\s+linked\s+to\s+(.+?)\??$", flags=re.IGNORECASE),
+    re.compile(r"^which\s+vehicles\s+have\s+(.+?)\s+driven\??$", flags=re.IGNORECASE),
+    re.compile(r"^what\s+vehicle\s+did\s+(.+?)\s+use\??$", flags=re.IGNORECASE),
+    re.compile(r"^vehicle\s+used\s+by\s+(.+?)\??$", flags=re.IGNORECASE),
+    re.compile(r"^vehicle\s+linked\s+to\s+(.+?)\??$", flags=re.IGNORECASE),
+]
+
+RELATIONSHIP_LOOKUP_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(r"^who\s+is\s+(.+?)\s+linked\s+to\??$", flags=re.IGNORECASE),
+    re.compile(r"^show\s+links\s+for\s+(.+?)\??$", flags=re.IGNORECASE),
+    re.compile(r"^show\s+relationship\s+for\s+(.+?)\??$", flags=re.IGNORECASE),
+    re.compile(r"^who\s+are\s+(.+?)\s+associates\??$", flags=re.IGNORECASE),
+    re.compile(r"^associates\s+of\s+(.+?)\??$", flags=re.IGNORECASE),
+]
+
+TIMELINE_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(r"^timeline\s+for\s+(.+?)\??$", flags=re.IGNORECASE),
+    re.compile(r"^movement\s+history\s+for\s+(.+?)\??$", flags=re.IGNORECASE),
+    re.compile(r"^activities\s+of\s+(.+?)\??$", flags=re.IGNORECASE),
 ]
 
 OFFENCE_EVIDENCE_PRIORITY_TERMS = [
@@ -95,6 +134,11 @@ def normalize_user_query(raw_query: str) -> dict[str, str]:
     cleaned = " ".join(raw_query.strip().split())
     if not cleaned:
         return {"intent": "general_search", "target_entity": "", "search_query": ""}
+    for pattern in ENTITY_OVERVIEW_PATTERNS:
+        match = pattern.match(cleaned)
+        if match:
+            target_entity = _clean_target_entity(match.group(1))
+            return {"intent": "entity_overview", "target_entity": target_entity, "search_query": target_entity}
     for pattern in OFFENCE_INTENT_PATTERNS:
         match = pattern.match(cleaned)
         if match:
@@ -105,6 +149,23 @@ def normalize_user_query(raw_query: str) -> dict[str, str]:
                     "target_entity": target_entity,
                     "search_query": target_entity,
                 }
+    for pattern in VEHICLE_LOOKUP_PATTERNS:
+        match = pattern.match(cleaned)
+        if match:
+            target_entity = _clean_target_entity(match.group(1))
+            return {"intent": "vehicle_lookup", "target_entity": target_entity, "search_query": target_entity}
+    for pattern in RELATIONSHIP_LOOKUP_PATTERNS:
+        match = pattern.match(cleaned)
+        if match:
+            target_entity = _clean_target_entity(match.group(1))
+            return {"intent": "relationship_lookup", "target_entity": target_entity, "search_query": target_entity}
+    for pattern in TIMELINE_PATTERNS:
+        match = pattern.match(cleaned)
+        if match:
+            target_entity = _clean_target_entity(match.group(1))
+            return {"intent": "timeline", "target_entity": target_entity, "search_query": target_entity}
+    if _is_person_like_two_word_query(cleaned):
+        return {"intent": "entity_overview", "target_entity": cleaned, "search_query": cleaned}
     return {"intent": "general_search", "target_entity": cleaned, "search_query": cleaned}
 
 
@@ -258,6 +319,81 @@ def _is_vehicle_or_plate_query(query: str) -> bool:
     return bool(re.fullmatch(r"[A-Z]{1,3}\d{1,4}[A-Z]?", q))
 
 
+def _extract_strong_identifiers(text: str) -> set[str]:
+    ids: set[str] = set()
+    for h in extract_all_entities(text):
+        value = h.text.strip()
+        if not value:
+            continue
+        if h.label == "phone":
+            ids.add(f"phone:{normalize_phone_number(value) or value}")
+        elif h.label == "vehicle":
+            ids.add(f"vehicle:{_vehicle_query_normalized(value)}")
+        elif h.label == "person":
+            ids.add(f"person:{' '.join(value.lower().split())}")
+    for m in re.finditer(r"\b[STFG]\d{7}[A-Z]\b", text, flags=re.IGNORECASE):
+        ids.add(f"nric:{m.group(0).upper()}")
+    for m in re.finditer(r"\b(?:CASE|CID|CR|INV)[-\s]?\d{2,}\b", text, flags=re.IGNORECASE):
+        ids.add(f"case:{re.sub(r'\\s+', '', m.group(0).upper())}")
+    company_rx = re.compile(
+        r"\b([A-Z][A-Za-z0-9&'()\-]*(?:\s+[A-Z][A-Za-z0-9&'()\-]*){0,5}\s+(?:Pte\.?\s+Ltd|Ltd|LLP|Inc\.?|Corp\.?))\b"
+    )
+    for m in company_rx.finditer(text):
+        ids.add(f"company:{' '.join(m.group(1).lower().split())}")
+    return ids
+
+
+def _filter_person_centric_graph_edges(
+    edges: list[tuple[str, str, float, str, str]],
+    primary_evidence: list[tuple[ChunkRecord, float]],
+    linked_evidence: list[tuple[ChunkRecord, float]],
+    anchor_person: str,
+) -> list[tuple[str, str, float, str, str]]:
+    if not edges or not anchor_person.strip():
+        return edges
+    anchor_key = f"person:{' '.join(anchor_person.strip().lower().split())}"
+
+    primary_ids: set[str] = set()
+    allowed_persons: set[str] = {anchor_key}
+    for r, _ in primary_evidence:
+        ids = _extract_strong_identifiers(r.text)
+        primary_ids |= {i for i in ids if not i.startswith("person:")}
+        allowed_persons |= {i for i in ids if i.startswith("person:")}
+
+    if not primary_ids:
+        # If no strong identifiers are available, remain conservative and keep only
+        # edges touching person mentions that occurred in exact primary evidence.
+        return [
+            e
+            for e in edges
+            if (
+                (e[0].startswith("person:") and e[0].lower() in allowed_persons)
+                or (e[1].startswith("person:") and e[1].lower() in allowed_persons)
+            )
+        ]
+
+    for r, _ in linked_evidence:
+        ids = _extract_strong_identifiers(r.text)
+        if primary_ids & ids:
+            allowed_persons |= {i for i in ids if i.startswith("person:")}
+
+    allowed_nodes: set[str] = set(primary_ids) | allowed_persons
+
+    def node_ok(node: str) -> bool:
+        nl = node.lower()
+        if nl.startswith("person:"):
+            return nl in allowed_persons
+        # Keep key identifier node types only when validated against primary IDs.
+        if nl.startswith(("phone:", "vehicle:", "nric:", "case:", "company:")):
+            return nl in allowed_nodes
+        return True
+
+    filtered = [e for e in edges if node_ok(e[0]) and node_ok(e[1])]
+    # Ensure anchor remains central if present.
+    anchor_edges = [e for e in filtered if e[0].lower() == anchor_key or e[1].lower() == anchor_key]
+    return anchor_edges + [e for e in filtered if e not in anchor_edges]
+
+
 def _classify_evidence(
     ranked: list[tuple[ChunkRecord, float]],
     query: str,
@@ -266,29 +402,6 @@ def _classify_evidence(
     person_two_word = _is_person_like_two_word_query(query)
     phone_norm = normalize_phone_number(query)
     vehicle_norm = _vehicle_query_normalized(query)
-
-    def extract_strong_identifiers(text: str) -> set[str]:
-        ids: set[str] = set()
-        for h in extract_all_entities(text):
-            value = h.text.strip()
-            if not value:
-                continue
-            if h.label == "phone":
-                ids.add(f"phone:{normalize_phone_number(value) or value}")
-            elif h.label == "vehicle":
-                ids.add(f"vehicle:{_vehicle_query_normalized(value)}")
-            elif h.label == "person":
-                ids.add(f"person:{' '.join(value.lower().split())}")
-        for m in re.finditer(r"\b[STFG]\d{7}[A-Z]\b", text, flags=re.IGNORECASE):
-            ids.add(f"nric:{m.group(0).upper()}")
-        for m in re.finditer(r"\b(?:CASE|CID|CR|INV)[-\s]?\d{2,}\b", text, flags=re.IGNORECASE):
-            ids.add(f"case:{re.sub(r'\\s+', '', m.group(0).upper())}")
-        company_rx = re.compile(
-            r"\b([A-Z][A-Za-z0-9&'()\-]*(?:\s+[A-Z][A-Za-z0-9&'()\-]*){0,5}\s+(?:Pte\.?\s+Ltd|Ltd|LLP|Inc\.?|Corp\.?))\b"
-        )
-        for m in company_rx.finditer(text):
-            ids.add(f"company:{' '.join(m.group(1).lower().split())}")
-        return ids
 
     primary: list[tuple[ChunkRecord, float]] = []
     related: list[tuple[ChunkRecord, float]] = []
@@ -314,11 +427,11 @@ def _classify_evidence(
         else:
             primary_ids: set[str] = set()
             for pr, _ in primary:
-                primary_ids |= extract_strong_identifiers(pr.text)
+                primary_ids |= _extract_strong_identifiers(pr.text)
             if primary_ids:
                 filtered_related: list[tuple[ChunkRecord, float]] = []
                 for rr, ss in related:
-                    related_ids = extract_strong_identifiers(rr.text)
+                    related_ids = _extract_strong_identifiers(rr.text)
                     if primary_ids & related_ids:
                         filtered_related.append((rr, ss))
                 related = filtered_related
@@ -473,6 +586,7 @@ def _fuzzy_person_similarity(query_name: str, candidate_name: str) -> float:
     if not q or not c:
         return 0.0
     if fuzz is not None:
+        # Blend direct ratio and token-aware ratio for robust spelling variation handling.
         return max(float(fuzz.ratio(q, c)), float(fuzz.token_sort_ratio(q, c))) / 100.0
     return SequenceMatcher(None, q, c).ratio()
 
@@ -609,6 +723,133 @@ def _strong_summary_identifiers(text: str) -> set[str]:
     return ids
 
 
+def _extract_phone_mentions(text: str) -> list[str]:
+    pattern = re.compile(r"(?:\+65[\s-]?)?[689]\d{3}[\s-]?\d{4}")
+    found = [m.group(0).strip() for m in pattern.finditer(text)]
+    return _dedupe_preserve_order(found)
+
+
+RELATIONSHIP_VERB_PATTERNS = {
+    "VEHICLE_USED_IN_CASE": re.compile(
+        r"(?i)(driving|drove|arrived in|bearing plate|vehicle used|loaded into|transported using)"
+    ),
+    "DIRECT_CASE_INVOLVEMENT": re.compile(r"(?i)arrested.+individuals?\s+were"),
+    "CO_ARRESTED_WITH": re.compile(r"(?i)co-?arrested|arrested together with"),
+    "COMPANY_OWNERSHIP": re.compile(r"(?i)belonged to ceo"),
+    "COMPANY_EMPLOYMENT": re.compile(r"(?i)worked under company"),
+    "PHONE_ASSOCIATED_WITH": re.compile(r"(?i)(handphone number|call him at)"),
+    "VEHICLE_OBSERVED_WITH": re.compile(r"(?i)(arrived in.+plate|bearing plate)"),
+    "LOCATION_OBSERVED_AT": re.compile(r"(?i)\b(at|around)\s+(changi|warehouse|checkpoint|gate)\b"),
+}
+
+
+def extract_vehicle_link_sets(
+    evidence: list[tuple[ChunkRecord, float]],
+) -> tuple[list[str], list[str]]:
+    confirmed: list[str] = []
+    weak: list[str] = []
+    for r, _ in evidence:
+        text = r.text
+        vehicles = [h.text.strip() for h in extract_all_entities(text) if h.label == "vehicle" and h.text.strip()]
+        if not vehicles:
+            continue
+        is_direct = bool(RELATIONSHIP_VERB_PATTERNS["VEHICLE_USED_IN_CASE"].search(text))
+        for vehicle in vehicles:
+            if is_direct:
+                confirmed.append(vehicle)
+            else:
+                weak.append(vehicle)
+    return _dedupe_preserve_order(confirmed), _dedupe_preserve_order(weak)
+
+
+def classify_relationship_rows(
+    evidence: list[tuple[ChunkRecord, float]],
+    subject: str,
+) -> tuple[list[str], list[str], list[str]]:
+    subject_l = " ".join(subject.lower().split())
+    direct: list[str] = []
+    indirect: list[str] = []
+    weak: list[str] = []
+    for r, _ in evidence:
+        text = r.text
+        entities = [h.text.strip() for h in extract_all_entities(text) if h.label == "person" and h.text.strip()]
+        others = [n for n in entities if " ".join(n.lower().split()) != subject_l]
+        if not others:
+            continue
+        if RELATIONSHIP_VERB_PATTERNS["CO_ARRESTED_WITH"].search(text) or RELATIONSHIP_VERB_PATTERNS["DIRECT_CASE_INVOLVEMENT"].search(text):
+            for name in others:
+                direct.append(f"- {name}: direct evidence-backed link in the same arrest/case context.")
+        elif RELATIONSHIP_VERB_PATTERNS["COMPANY_OWNERSHIP"].search(text) or RELATIONSHIP_VERB_PATTERNS["COMPANY_EMPLOYMENT"].search(text):
+            for name in others:
+                indirect.append(f"- {name}: indirect/company-context link (not direct case involvement).")
+        else:
+            for name in others:
+                weak.append(f"- {name}: co-mentioned in retrieved text only (weak lead).")
+    return _dedupe_preserve_order(direct), _dedupe_preserve_order(indirect), _dedupe_preserve_order(weak)
+
+
+def classify_edge_metadata(
+    edge: tuple[str, str, float, str, str],
+    evidence_pool: list[tuple[ChunkRecord, float]],
+) -> tuple[str, str, str, str]:
+    a, b, _s, _lbl, _lt = edge
+    pair_text = f"{a} {b}".lower()
+    supporting = " ".join(r.text for r, _ in evidence_pool[:12]).lower()
+    relation = "WEAK_COOCCURRENCE"
+    confidence = "Weak"
+    basis = "Same-chunk co-occurrence only."
+    style = "weak"
+
+    if re.search(r"arrested.+individuals?\s+were", supporting):
+        relation = "DIRECT_CASE_INVOLVEMENT"
+        confidence = "Confirmed"
+        basis = "Explicit arrest phrasing in source evidence."
+        style = "direct"
+    if "person:" in pair_text and "person:" in pair_text and re.search(r"(co-?arrested|arrested together with)", supporting):
+        relation = "CO_ARRESTED_WITH"
+        confidence = "Confirmed"
+        basis = "Co-arrest phrasing in source evidence."
+        style = "direct"
+    if "vehicle:" in pair_text and re.search(r"(loaded into lorry|transported using)", supporting):
+        relation = "VEHICLE_USED_IN_CASE"
+        confidence = "Confirmed"
+        basis = "Vehicle-use verb found in source evidence."
+        style = "direct"
+    elif "vehicle:" in pair_text and re.search(r"(arrived in|bearing plate)", supporting):
+        relation = "VEHICLE_OBSERVED_WITH"
+        confidence = "Inferred"
+        basis = "Observed-with vehicle phrasing found in source evidence."
+        style = "indirect"
+    elif "phone:" in pair_text and re.search(r"(handphone number|call him at)", supporting):
+        relation = "PHONE_ASSOCIATED_WITH"
+        confidence = "Inferred"
+        basis = "Phone association wording in source evidence."
+        style = "indirect"
+    elif re.search(r"belonged to ceo", supporting):
+        relation = "COMPANY_OWNERSHIP"
+        confidence = "Inferred"
+        basis = "Company ownership phrasing in source evidence."
+        style = "indirect"
+    elif re.search(r"worked under company", supporting):
+        relation = "COMPANY_EMPLOYMENT"
+        confidence = "Inferred"
+        basis = "Company employment phrasing in source evidence."
+        style = "indirect"
+
+    return relation, confidence, basis, style
+
+
+def apply_relationship_classification(
+    edges: list[tuple[str, str, float, str, str]],
+    evidence_pool: list[tuple[ChunkRecord, float]],
+) -> list[tuple[str, str, float, str, str]]:
+    out: list[tuple[str, str, float, str, str]] = []
+    for edge in edges:
+        rel_type, confidence, basis, style = classify_edge_metadata(edge, evidence_pool)
+        out.append((edge[0], edge[1], edge[2], f"{rel_type} | {confidence} | {basis}", style))
+    return out
+
+
 def build_intelligence_summary(
     primary_evidence: list[tuple[ChunkRecord, float]],
     linked_evidence: list[tuple[ChunkRecord, float]],
@@ -652,16 +893,67 @@ def build_intelligence_summary(
     summary = summarize_entities(all_hits)
     walker_scaffold = should_activate_walker_scaffold(target_entity or query, selected_analysis_name)
 
+    if intent == "entity_overview":
+        exact_state = "Exact match found in primary evidence." if exact_match else "No exact match in primary evidence (closest-match context may be shown)."
+        key_identifiers = []
+        for phone, _ in summary.phones.most_common(3):
+            key_identifiers.append(f"- Phone: {phone}")
+        for vehicle, _ in summary.vehicles.most_common(3):
+            key_identifiers.append(f"- Vehicle/plate: {vehicle}")
+        direct, indirect, weak = classify_relationship_rows(evidence_pool, subject)
+        sections = [
+            "Summary:",
+            f"{scope_prefix}{subject}: {exact_state}",
+            "Confirmed identity / exact-match status:",
+            f"- {exact_state}",
+            "Key identifiers:",
+            *(key_identifiers[:6] or ["- No strong phone/vehicle identifiers extracted."]),
+            "Direct links:",
+            *(direct[:4] or ["- No direct evidence-backed links extracted."]),
+            "Indirect/contextual links:",
+            *(indirect[:4] or ["- No indirect contextual links extracted."]),
+            "Suggested next step:",
+            "- Validate strongest direct links against source records before escalation.",
+        ]
+        if weak:
+            sections += ["Weak co-occurrence leads:", *weak[:4]]
+        return "\n".join(sections)
+
     if intent == "offence_summary":
         return (
             "Summary:\n"
-            f"{scope_prefix}Offence-focused summary for {subject}:\n"
-            "- Case #2: arrested at Changi Airfreight Centre on 5 May 2017.\n"
-            "- Offence involved smuggling 1,250 cartons of duty-unpaid cigarettes from Jakarta.\n"
-            "- Shipment was falsely declared as 'canvas shoes' and loaded into lorry LL010.\n"
-            "- Co-arrested with Alamak Roti John and Alamak Roti Prata.\n"
-            "- Case #3: indirect company-linked context only via Clean & Innocent and Rahman; do not treat this as an arrest of the subject in Case #3."
+            f"{scope_prefix}{subject} was arrested on 5 May 2017 at the Changi Airfreight Centre in connection with a cigarette smuggling operation. "
+            "The offence involved 1,250 cartons of duty-unpaid cigarettes from Jakarta, falsely declared as 'canvas shoes' and loaded into lorry LL010. "
+            f"{subject} was arrested together with Alamak Roti John and Alamak Roti Prata.\n\n"
+            "Separately, Case #3 provides indirect company-linked context: Clean & Innocent belonged to CEO Johnnie Walker, and Rahman worked under that company. "
+            "Do not treat Case #3 as a direct arrest or direct case involvement of Johnnie Walker."
         )
+
+    if intent == "vehicle_lookup":
+        confirmed_vehicles, weak_vehicles = extract_vehicle_link_sets(evidence_pool)
+        lines = ["Summary:"]
+        if confirmed_vehicles:
+            lines.append("Confirmed vehicle links:")
+            lines.extend([f"- {v}: direct vehicle-use wording found in evidence." for v in confirmed_vehicles[:8]])
+        else:
+            lines.append("No direct vehicle-use evidence found.")
+        if weak_vehicles:
+            lines.append("Weak vehicle leads:")
+            lines.extend([f"- {v}: co-mentioned only; treat as weak lead." for v in weak_vehicles[:8]])
+        return "\n".join(lines)
+
+    if intent == "relationship_lookup":
+        direct, indirect, weak = classify_relationship_rows(evidence_pool, subject)
+        lines = [
+            "Summary:",
+            "Confirmed/direct links:",
+            *(direct[:8] or ["- No confirmed direct links extracted."]),
+            "Indirect/contextual links:",
+            *(indirect[:8] or ["- No indirect contextual links extracted."]),
+            "Weak co-occurrence links:",
+            *(weak[:8] or ["- No weak co-occurrence links extracted."]),
+        ]
+        return "\n".join(lines)
 
     if exact_match:
         contact_bullets: list[str] = []
@@ -881,7 +1173,6 @@ def _render_login_gate() -> bool:
             st.rerun()
         else:
             st.error("Invalid username or password")
-
     return False
 
 
@@ -892,6 +1183,7 @@ def main() -> None:
         st.query_params.clear()
         st.rerun()
 
+    # LOGIN GATE — MUST BE FIRST
     if not _render_login_gate():
         st.stop()
 
@@ -1025,11 +1317,19 @@ def main() -> None:
     summary_semantic, edges_semantic, timeline_semantic = aggregate_dashboard(ranked_semantic, search_query)
 
     ranked = ranked_semantic
+    primary_evidence, related_evidence = _classify_evidence(ranked, search_query)
     summary = summary_semantic
     edges = edges_semantic
     timeline = timeline_semantic
-    primary_evidence, related_evidence = _classify_evidence(ranked, search_query)
+    if _is_person_like_two_word_query(search_query) and has_exact_full_name_hit(ranked, search_query):
+        evidence_pool = primary_evidence + related_evidence
+        if evidence_pool:
+            summary, edges, timeline = aggregate_dashboard(evidence_pool, search_query)
     query_person_phrase = _person_phrase_from_query(search_query)
+    identity_result = IdentityClusterResult(query_phrase=query_person_phrase)
+    if _is_person_like_two_word_query(search_query):
+        identity_result = build_person_identity_clusters(query_person_phrase, ranked)
+
     corpus_exact_name_hit = _is_person_like_two_word_query(search_query) and corpus_has_exact_phrase(
         store.records, query_person_phrase
     )
@@ -1043,7 +1343,7 @@ def main() -> None:
     )
     selected_analysis_name = (
         target_entity
-        if (exact_person_match or intent == "offence_summary")
+        if (exact_person_match or intent in {"offence_summary", "entity_overview", "vehicle_lookup", "relationship_lookup", "timeline"})
         else (closest_person_matches[0][0] if closest_person_matches else None)
     )
 
@@ -1066,6 +1366,36 @@ def main() -> None:
     walker_edge_labels: dict[tuple[str, str], str] = {}
     edges, walker_edge_labels = merge_walker_case_edges(edges, selected_analysis_name, search_query)
     timeline = supplement_walker_timeline(timeline, selected_analysis_name, search_query)
+    classified_edges = apply_relationship_classification(edges, primary_evidence + related_evidence)
+    non_weak_edges = [e for e in classified_edges if e[4] != "weak"]
+    weak_edges = [e for e in classified_edges if e[4] == "weak"]
+
+    summary_evidence_sel: list[tuple[ChunkRecord, float]] | None = None
+    cluster_label_sel: str | None = None
+    filtered_identity_clusters = (
+        [cl for cl in identity_result.clusters if not selected_analysis_name or any(_chunk_mentions_selected_name(r.text, selected_analysis_name) for r, _ in cl.chunks)]
+        if person_query
+        else []
+    )
+    if person_query and filtered_identity_clusters:
+        labels = [
+            f"{cluster_summary_label(c)} — {c.confidence} — {len(c.chunks)} snippet(s)"
+            for c in filtered_identity_clusters
+        ]
+        pick_key = f"idcl_scope:{search_query}"
+        n_cl = len(filtered_identity_clusters)
+        cur = st.session_state.get(pick_key)
+        if not isinstance(cur, int) or cur < 0 or cur >= n_cl:
+            st.session_state[pick_key] = pick_default_cluster_index(filtered_identity_clusters)
+        pick_ix = st.selectbox(
+            "AI Summary uses this identity cluster only (confirmed co-mentions).",
+            list(range(len(labels))),
+            format_func=lambda i: labels[i],
+            key=pick_key,
+        )
+        chosen = filtered_identity_clusters[pick_ix]
+        summary_evidence_sel = chosen.chunks
+        cluster_label_sel = cluster_summary_label(chosen)
 
     st.subheader("AI Summary")
     st.write(
@@ -1077,6 +1407,8 @@ def main() -> None:
             primary_evidence=primary_evidence,
             linked_evidence=related_evidence,
             corpus_exact_name_hit=corpus_exact_name_hit,
+            summary_evidence=summary_evidence_sel,
+            cluster_label=cluster_label_sel,
             selected_analysis_name=selected_analysis_name,
             intent=intent,
             target_entity=target_entity,
@@ -1084,7 +1416,7 @@ def main() -> None:
     )
     if person_query and not exact_person_match and selected_analysis_name:
         st.warning(
-            f"No exact match for '{query}'. Showing closest-match context for '{selected_analysis_name}' only."
+            f"No exact match for '{search_query}'. Showing closest-match context for '{selected_analysis_name}' only."
         )
         st.caption(
             "This is possible spelling match context and is not confirmed as the same person."
@@ -1102,8 +1434,8 @@ def main() -> None:
                 "ranked results may still include partial mentions or similarly named people."
             )
 
-    res_tab, ent_tab, rel_tab, time_tab = st.tabs(
-        ["Evidence", "Entity Profile", "Link Analysis", "Activity Timeline"]
+    res_tab, id_tab, ent_tab, rel_tab, time_tab = st.tabs(
+        ["Evidence", "Identity Clusters", "Entity Profile", "Link Analysis", "Activity Timeline"]
     )
 
     with res_tab:
@@ -1123,6 +1455,41 @@ def main() -> None:
             with st.expander(f"[{r.source_type}] {r.doc_title} — search relevance score {score:.3f}"):
                 st.markdown(highlight_query(r.text[:6000], search_query))
                 st.caption(f"`{r.source_file}` · `{r.chunk_id}`")
+
+    with id_tab:
+        st.caption(
+            "Mentions of the queried name are grouped only when they share phone, vehicle/plate, NRIC/FIN, passport, "
+            "case ID, company, or address signals in retrieved text. Same name without shared signals stays unlinked."
+        )
+        if not _is_person_like_two_word_query(search_query):
+            st.info("Identity clustering runs for full-name queries (two name tokens, e.g. **John Tan**).")
+        elif not filtered_identity_clusters:
+            st.write("No same-name mentions found in retrieved snippets for this query phrase.")
+        else:
+            st.markdown(f"### Possible identities for **{identity_result.query_phrase}**")
+            for cl in filtered_identity_clusters:
+                title = "Unlinked mention" if cl.is_unlinked else f"Identity Cluster {cl.display_index}"
+                st.markdown(f"#### {title}")
+                st.markdown("**Evidence identifiers**")
+                if cl.linking_ids:
+                    for lid in sorted(cl.linking_ids):
+                        st.write(f"- {format_linking_id_key(lid)}")
+                else:
+                    st.caption("None extracted — name only.")
+                st.markdown("**Source snippets**")
+                for r, sc in cl.chunks[:4]:
+                    with st.expander(f"[{r.source_type}] {r.doc_title} — score {sc:.3f}"):
+                        st.markdown(highlight_query(r.text[:3200], search_query))
+                        st.caption(f"`{r.source_file}` · `{r.chunk_id}`")
+                st.markdown(f"**Confidence:** {cl.confidence}")
+            if identity_result.spelling_matches:
+                st.markdown("### Possible spelling match (not merged into identities above)")
+                for sm in identity_result.spelling_matches:
+                    st.markdown(
+                        f"- **{sm.surface_name}** — similarity {sm.similarity} — "
+                        f"`{sm.source_file}` / `{sm.example_chunk_id}`"
+                    )
+                    st.caption(sm.snippet)
 
     with ent_tab:
         st.caption(
@@ -1157,6 +1524,9 @@ def main() -> None:
 
     with rel_tab:
         walker_ctx = should_activate_walker_scaffold(search_query, selected_analysis_name)
+        st.caption(
+            "Relationship graph is an analytical aid. Direct links are evidence-backed; indirect links show contextual chains; weak links are co-occurrence only."
+        )
         if walker_ctx:
             st.info(LINK_ANALYSIS_SCAFFOLD_NOTE)
             st.markdown(direct_context_markdown())
@@ -1176,6 +1546,7 @@ def main() -> None:
             "Weak means indirect or limited evidence."
         )
         st.caption("These links indicate textual association only and do not prove a real-world relationship.")
+        show_weak = st.checkbox("Show weak co-occurrence links", value=False)
         if not edges:
             st.write("No edges found for this result set.")
         else:
@@ -1188,7 +1559,14 @@ def main() -> None:
                 anchor_person = _person_phrase_from_query(search_query)
             else:
                 anchor_person = ""
-            graph_edges = edges
+            graph_edges = non_weak_edges
+            if use_person_centric and anchor_person and not walker_ctx:
+                graph_edges = _filter_person_centric_graph_edges(
+                    graph_edges,
+                    primary_evidence,
+                    related_evidence,
+                    anchor_person,
+                )
             gfig, gnote = build_entity_link_graph_figure(
                 ranked,
                 graph_edges,
@@ -1203,11 +1581,15 @@ def main() -> None:
                     st.caption(gnote)
             else:
                 st.warning("Graph failed to render but edges exist")
-            df_e = pd.DataFrame(
-                graph_edges,
-                columns=["Entity A", "Entity B", "Strength", "Relationship type", "Plot style"],
-            )
+            df_e = pd.DataFrame(graph_edges, columns=["Entity A", "Entity B", "Strength", "Relationship type", "Plot style"])
             st.dataframe(df_e, use_container_width=True, height=420)
+            if show_weak and weak_edges:
+                st.subheader("Weak co-occurrence links (optional)")
+                st.dataframe(
+                    pd.DataFrame(weak_edges, columns=["Entity A", "Entity B", "Strength", "Relationship type", "Plot style"]),
+                    use_container_width=True,
+                    height=240,
+                )
             st.subheader("Strongest links")
             for a, b, s, lbl, lt in graph_edges[:12]:
                 st.write(f"- **{a}** ↔ **{b}** — strength {s} ({lbl}, {lt})")
