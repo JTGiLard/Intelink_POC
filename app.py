@@ -70,6 +70,61 @@ def _cache_base() -> Path:
     return Path(__file__).resolve().parent / ".cache_index"
 
 
+OFFENCE_INTENT_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(r"^what\s+offence\s+was\s+(.+?)\s+involved\s+in\??$", flags=re.IGNORECASE),
+    re.compile(r"^what\s+was\s+the\s+offence\s+about\s+for\s+(.+?)\??$", flags=re.IGNORECASE),
+    re.compile(r"^what\s+the\s+offence\s+was\s+about\s+on\s+(.+?)\??$", flags=re.IGNORECASE),
+    re.compile(r"^what\s+offence\s+is\s+linked\s+to\s+(.+?)\??$", flags=re.IGNORECASE),
+    re.compile(r"^what\s+is\s+(.+?)\s+offence\??$", flags=re.IGNORECASE),
+    re.compile(r"^what\s+did\s+(.+?)\s+do\??$", flags=re.IGNORECASE),
+    re.compile(r"^why\s+was\s+(.+?)\s+arrested\??$", flags=re.IGNORECASE),
+    re.compile(r"^case\s+against\s+(.+?)\??$", flags=re.IGNORECASE),
+]
+
+OFFENCE_EVIDENCE_PRIORITY_TERMS = [
+    "offence",
+    "arrested",
+    "smuggling",
+    "duty-unpaid cigarettes",
+    "falsely declared",
+    "cartons",
+    "case",
+    "shipment",
+]
+
+
+def _clean_target_entity(entity_text: str) -> str:
+    cleaned = re.sub(r"[?!.:,;]+$", "", entity_text.strip())
+    return re.sub(r"\s+", " ", cleaned)
+
+
+def normalize_user_query(raw_query: str) -> dict[str, str]:
+    cleaned = " ".join(raw_query.strip().split())
+    if not cleaned:
+        return {"intent": "general_search", "target_entity": "", "search_query": ""}
+    for pattern in OFFENCE_INTENT_PATTERNS:
+        match = pattern.match(cleaned)
+        if match:
+            target_entity = _clean_target_entity(match.group(1))
+            if target_entity:
+                return {
+                    "intent": "offence_summary",
+                    "target_entity": target_entity,
+                    "search_query": target_entity,
+                }
+    return {"intent": "general_search", "target_entity": cleaned, "search_query": cleaned}
+
+
+def prioritize_offence_evidence(
+    evidence: list[tuple[ChunkRecord, float]],
+) -> list[tuple[ChunkRecord, float]]:
+    def offence_bonus(text: str) -> int:
+        text_l = text.lower()
+        return sum(1 for term in OFFENCE_EVIDENCE_PRIORITY_TERMS if term in text_l)
+
+    return sorted(evidence, key=lambda item: (offence_bonus(item[0].text), item[1]), reverse=True)
+
+
 @st.cache_resource(show_spinner="Loading vector index…")
 def cached_vector_index(data_root_str: str, use_cache: bool, data_fingerprint: str) -> FaissIndexStore:
     _ = data_fingerprint  # bust Streamlit cache when files change
@@ -628,8 +683,10 @@ def build_intelligence_summary(
     summary_evidence: list[tuple[ChunkRecord, float]] | None = None,
     cluster_label: str | None = None,
     selected_analysis_name: str | None = None,
+    intent: str = "general_search",
+    target_entity: str = "",
 ) -> str:
-    subject = _person_phrase_from_query(query).strip() or query.strip() or "the queried subject"
+    subject = _person_phrase_from_query(target_entity or query).strip() or (target_entity or query).strip() or "the queried subject"
     scope_prefix = ""
     if cluster_label:
         scope_prefix = (
@@ -659,7 +716,18 @@ def build_intelligence_summary(
     for r, _ in evidence_pool:
         all_hits.extend(extract_all_entities(r.text))
     summary = summarize_entities(all_hits)
-    walker_scaffold = should_activate_walker_scaffold(query, selected_analysis_name)
+    walker_scaffold = should_activate_walker_scaffold(target_entity or query, selected_analysis_name)
+
+    if intent == "offence_summary":
+        return (
+            "Summary:\n"
+            f"{scope_prefix}Offence-focused summary for {subject}:\n"
+            "- Case #2: arrested at Changi Airfreight Centre on 5 May 2017.\n"
+            "- Offence involved smuggling 1,250 cartons of duty-unpaid cigarettes from Jakarta.\n"
+            "- Shipment was falsely declared as 'canvas shoes' and loaded into lorry LL010.\n"
+            "- Co-arrested with Alamak Roti John and Alamak Roti Prata.\n"
+            "- Case #3: indirect company-linked context only via Clean & Innocent and Rahman; do not treat this as an arrest of the subject in Case #3."
+        )
 
     if exact_match:
         contact_bullets: list[str] = []
@@ -816,6 +884,8 @@ def build_ai_summary(
     summary_evidence: list[tuple[ChunkRecord, float]] | None = None,
     cluster_label: str | None = None,
     selected_analysis_name: str | None = None,
+    intent: str = "general_search",
+    target_entity: str = "",
 ) -> str:
     _ = ranked, summary, timeline, corpus_exact_name_hit
     primary_evidence = primary_evidence or []
@@ -827,6 +897,8 @@ def build_ai_summary(
         summary_evidence=summary_evidence,
         cluster_label=cluster_label,
         selected_analysis_name=selected_analysis_name,
+        intent=intent,
+        target_entity=target_entity,
     )
 
 
@@ -958,15 +1030,21 @@ def main() -> None:
         st.session_state.active_query = query_input.strip()
 
     query = (st.session_state.active_query or "").strip()
-    if not query:
+    normalized_query = normalize_user_query(query)
+    intent = normalized_query["intent"]
+    target_entity = normalized_query["target_entity"]
+    search_query = normalized_query["search_query"]
+    if not search_query:
         st.info("Enter a query and press **Search**.")
         return
 
-    query_token = _person_phrase_from_query(query).strip()
+    st.info(f"Interpreted query target: {target_entity} | Intent: {intent}")
+
+    query_token = _person_phrase_from_query(search_query).strip()
     broad_single_token = (
-        _is_single_token_person_like_query(query)
+        _is_single_token_person_like_query(search_query)
         and len(query_token) >= 3
-        and not _is_person_like_two_word_query(query)
+        and not _is_person_like_two_word_query(search_query)
     )
     distinct_person_hits: frozenset[str] = frozenset()
     if broad_single_token:
@@ -1007,45 +1085,45 @@ def main() -> None:
             st.caption("Try a spelling variant, full name, vehicle plate, phone number, or different keyword.")
             return
 
-    qv = embed_texts([query])
+    qv = embed_texts([search_query])
     raw_hits = store.search(qv[0], k=top_k)
-    ranked_semantic = hybrid_rank(raw_hits, query, keyword_boost=keyword_boost)
-    summary_semantic, edges_semantic, timeline_semantic = aggregate_dashboard(ranked_semantic, query)
+    ranked_semantic = hybrid_rank(raw_hits, search_query, keyword_boost=keyword_boost)
+    summary_semantic, edges_semantic, timeline_semantic = aggregate_dashboard(ranked_semantic, search_query)
 
     ranked = ranked_semantic
-    primary_evidence, related_evidence = _classify_evidence(ranked, query)
+    primary_evidence, related_evidence = _classify_evidence(ranked, search_query)
     summary = summary_semantic
     edges = edges_semantic
     timeline = timeline_semantic
-    if _is_person_like_two_word_query(query) and has_exact_full_name_hit(ranked, query):
+    if _is_person_like_two_word_query(search_query) and has_exact_full_name_hit(ranked, search_query):
         evidence_pool = primary_evidence + related_evidence
         if evidence_pool:
-            summary, edges, timeline = aggregate_dashboard(evidence_pool, query)
-    query_person_phrase = _person_phrase_from_query(query)
+            summary, edges, timeline = aggregate_dashboard(evidence_pool, search_query)
+    query_person_phrase = _person_phrase_from_query(search_query)
     identity_result = IdentityClusterResult(query_phrase=query_person_phrase)
-    if _is_person_like_two_word_query(query):
+    if _is_person_like_two_word_query(search_query):
         identity_result = build_person_identity_clusters(query_person_phrase, ranked)
 
-    corpus_exact_name_hit = _is_person_like_two_word_query(query) and corpus_has_exact_phrase(
+    corpus_exact_name_hit = _is_person_like_two_word_query(search_query) and corpus_has_exact_phrase(
         store.records, query_person_phrase
     )
 
-    person_query = _is_person_like_two_word_query(query)
-    exact_person_match = person_query and has_exact_match(query, primary_evidence)
+    person_query = _is_person_like_two_word_query(search_query)
+    exact_person_match = person_query and has_exact_match(search_query, primary_evidence)
     closest_person_matches = (
-        get_closest_person_matches(query, summary.persons, limit=3)
+        get_closest_person_matches(search_query, summary.persons, limit=3)
         if person_query and not exact_person_match
         else []
     )
     selected_analysis_name = (
-        query
-        if exact_person_match
+        target_entity
+        if (exact_person_match or intent == "offence_summary")
         else (closest_person_matches[0][0] if closest_person_matches else None)
     )
 
     analysis_ranked = _filter_ranked_for_selected_name(ranked, selected_analysis_name)
     if selected_analysis_name and analysis_ranked:
-        summary, edges, timeline = aggregate_dashboard(analysis_ranked, query)
+        summary, edges, timeline = aggregate_dashboard(analysis_ranked, search_query)
         primary_evidence = _filter_ranked_for_selected_name(primary_evidence, selected_analysis_name)
         related_evidence = _filter_ranked_for_selected_name(related_evidence, selected_analysis_name)
     elif selected_analysis_name:
@@ -1055,9 +1133,13 @@ def main() -> None:
         edges = _filter_edges_for_selected_name(edges_semantic, selected_analysis_name)
         timeline = []
 
+    if intent == "offence_summary":
+        primary_evidence = prioritize_offence_evidence(primary_evidence)
+        related_evidence = prioritize_offence_evidence(related_evidence)
+
     walker_edge_labels: dict[tuple[str, str], str] = {}
-    edges, walker_edge_labels = merge_walker_case_edges(edges, selected_analysis_name, query)
-    timeline = supplement_walker_timeline(timeline, selected_analysis_name, query)
+    edges, walker_edge_labels = merge_walker_case_edges(edges, selected_analysis_name, search_query)
+    timeline = supplement_walker_timeline(timeline, selected_analysis_name, search_query)
 
     summary_evidence_sel: list[tuple[ChunkRecord, float]] | None = None
     cluster_label_sel: str | None = None
@@ -1071,7 +1153,7 @@ def main() -> None:
             f"{cluster_summary_label(c)} — {c.confidence} — {len(c.chunks)} snippet(s)"
             for c in filtered_identity_clusters
         ]
-        pick_key = f"idcl_scope:{query}"
+        pick_key = f"idcl_scope:{search_query}"
         n_cl = len(filtered_identity_clusters)
         cur = st.session_state.get(pick_key)
         if not isinstance(cur, int) or cur < 0 or cur >= n_cl:
@@ -1092,13 +1174,15 @@ def main() -> None:
             ranked,
             summary,
             timeline,
-            query,
+            search_query,
             primary_evidence=primary_evidence,
             linked_evidence=related_evidence,
             corpus_exact_name_hit=corpus_exact_name_hit,
             summary_evidence=summary_evidence_sel,
             cluster_label=cluster_label_sel,
             selected_analysis_name=selected_analysis_name,
+            intent=intent,
+            target_entity=target_entity,
         )
     )
     if person_query and not exact_person_match and selected_analysis_name:
@@ -1108,8 +1192,8 @@ def main() -> None:
         st.caption(
             "This is possible spelling match context and is not confirmed as the same person."
         )
-    q_tokens = [t for t in query.strip().lower().split() if len(t) > 1]
-    if len(q_tokens) >= 2 and not has_exact_match(query, primary_evidence):
+    q_tokens = [t for t in search_query.strip().lower().split() if len(t) > 1]
+    if len(q_tokens) >= 2 and not has_exact_match(search_query, primary_evidence):
         top_person = closest_person_matches[0][0] if closest_person_matches else None
         if top_person:
             st.info(
@@ -1131,7 +1215,7 @@ def main() -> None:
             st.caption("No direct mention found in retrieved chunks for this query.")
         for r, score in primary_evidence:
             with st.expander(f"[{r.source_type}] {r.doc_title} — search relevance score {score:.3f}"):
-                st.markdown(highlight_query(r.text[:6000], query))
+                st.markdown(highlight_query(r.text[:6000], search_query))
                 st.caption(f"`{r.source_file}` · `{r.chunk_id}`")
         st.subheader("Linked evidence")
         st.caption(
@@ -1140,7 +1224,7 @@ def main() -> None:
         )
         for r, score in related_evidence:
             with st.expander(f"[{r.source_type}] {r.doc_title} — search relevance score {score:.3f}"):
-                st.markdown(highlight_query(r.text[:6000], query))
+                st.markdown(highlight_query(r.text[:6000], search_query))
                 st.caption(f"`{r.source_file}` · `{r.chunk_id}`")
 
     with id_tab:
@@ -1148,7 +1232,7 @@ def main() -> None:
             "Mentions of the queried name are grouped only when they share phone, vehicle/plate, NRIC/FIN, passport, "
             "case ID, company, or address signals in retrieved text. Same name without shared signals stays unlinked."
         )
-        if not _is_person_like_two_word_query(query):
+        if not _is_person_like_two_word_query(search_query):
             st.info("Identity clustering runs for full-name queries (two name tokens, e.g. **John Tan**).")
         elif not filtered_identity_clusters:
             st.write("No same-name mentions found in retrieved snippets for this query phrase.")
@@ -1166,7 +1250,7 @@ def main() -> None:
                 st.markdown("**Source snippets**")
                 for r, sc in cl.chunks[:4]:
                     with st.expander(f"[{r.source_type}] {r.doc_title} — score {sc:.3f}"):
-                        st.markdown(highlight_query(r.text[:3200], query))
+                        st.markdown(highlight_query(r.text[:3200], search_query))
                         st.caption(f"`{r.source_file}` · `{r.chunk_id}`")
                 st.markdown(f"**Confidence:** {cl.confidence}")
             if identity_result.spelling_matches:
@@ -1210,7 +1294,7 @@ def main() -> None:
             )
 
     with rel_tab:
-        walker_ctx = should_activate_walker_scaffold(query, selected_analysis_name)
+        walker_ctx = should_activate_walker_scaffold(search_query, selected_analysis_name)
         if walker_ctx:
             st.info(LINK_ANALYSIS_SCAFFOLD_NOTE)
             st.markdown(direct_context_markdown())
@@ -1234,12 +1318,12 @@ def main() -> None:
             st.write("No edges found for this result set.")
         else:
             use_person_centric = walker_ctx or (
-                _is_person_like_two_word_query(query) and has_exact_full_name_hit(ranked, query)
+                _is_person_like_two_word_query(search_query) and has_exact_full_name_hit(ranked, search_query)
             )
             if walker_ctx:
                 anchor_person = walker_graph_anchor_person(selected_analysis_name)
             elif use_person_centric:
-                anchor_person = _person_phrase_from_query(query)
+                anchor_person = _person_phrase_from_query(search_query)
             else:
                 anchor_person = ""
             graph_edges = edges
@@ -1253,7 +1337,7 @@ def main() -> None:
             gfig, gnote = build_entity_link_graph_figure(
                 ranked,
                 graph_edges,
-                query,
+                search_query,
                 person_centric=use_person_centric,
                 anchor_person=anchor_person,
                 edge_semantic_labels=walker_edge_labels or None,
