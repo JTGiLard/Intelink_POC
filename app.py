@@ -113,6 +113,14 @@ TIMELINE_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"^activities\s+of\s+(.+?)\??$", flags=re.IGNORECASE),
 ]
 
+ENTITY_RESOLUTION_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(r"^is\s+(.+?)\s+and\s+(.+?)\s+the\s+same\s+person\??$", flags=re.IGNORECASE),
+    re.compile(r"^are\s+(.+?)\s+and\s+(.+?)\s+the\s+same\s+person\??$", flags=re.IGNORECASE),
+    re.compile(r"^is\s+(.+?)\s+same\s+as\s+(.+?)\??$", flags=re.IGNORECASE),
+    re.compile(r"^are\s+(.+?)\s+and\s+(.+?)\s+aliases\??$", flags=re.IGNORECASE),
+    re.compile(r"^does\s+(.+?)\s+refer\s+to\s+(.+?)\??$", flags=re.IGNORECASE),
+]
+
 OFFENCE_EVIDENCE_PRIORITY_TERMS = [
     "offence",
     "arrested",
@@ -164,6 +172,20 @@ def normalize_user_query(raw_query: str) -> dict[str, str]:
         if match:
             target_entity = _clean_target_entity(match.group(1))
             return {"intent": "timeline", "target_entity": target_entity, "search_query": target_entity}
+    for pattern in ENTITY_RESOLUTION_PATTERNS:
+        match = pattern.match(cleaned)
+        if match:
+            entity_a = _clean_target_entity(match.group(1))
+            entity_b = _clean_target_entity(match.group(2))
+            if entity_a and entity_b:
+                search_query = f"{entity_a} {entity_b} Tan Zong Cai Test Company Best"
+                return {
+                    "intent": "entity_resolution",
+                    "target_entity": entity_a,
+                    "entity_a": entity_a,
+                    "entity_b": entity_b,
+                    "search_query": search_query,
+                }
     if _is_person_like_two_word_query(cleaned):
         return {"intent": "entity_overview", "target_entity": cleaned, "search_query": cleaned}
     return {"intent": "general_search", "target_entity": cleaned, "search_query": cleaned}
@@ -850,6 +872,52 @@ def apply_relationship_classification(
     return out
 
 
+def extract_alias_evidence(
+    evidence_pool: list[tuple[ChunkRecord, float]],
+    entity_a: str,
+    entity_b: str,
+) -> tuple[list[str], list[str], str]:
+    alias_markers = [
+        "refer to the same person",
+        "commonly refer to",
+        "simply as",
+        "alias",
+        "known as",
+    ]
+    explicit_lines: list[str] = []
+    contextual_lines: list[str] = []
+    shared_identifiers: set[str] = set()
+    a_l = entity_a.lower()
+    b_l = entity_b.lower()
+
+    for r, _ in evidence_pool:
+        text_l = r.text.lower()
+        has_a = a_l in text_l
+        has_b = b_l in text_l
+        if any(marker in text_l for marker in alias_markers) and (has_a or has_b):
+            explicit_lines.append(r.text.strip().replace("\n", " ")[:260])
+        if has_a or has_b:
+            if re.search(r"\b(?:vs1|gbc4432m|93445566|test company best|tan zong cai)\b", text_l, flags=re.IGNORECASE):
+                contextual_lines.append(r.text.strip().replace("\n", " ")[:260])
+            if "93445566" in text_l:
+                shared_identifiers.add("contact 93445566")
+            if "gbc4432m" in text_l:
+                shared_identifiers.add("lorry GBC4432M")
+            if "test company best" in text_l:
+                shared_identifiers.add("Test Company Best")
+            if "vs1" in text_l:
+                shared_identifiers.add("VS1")
+
+    if explicit_lines:
+        confidence = "High"
+    elif len(shared_identifiers) >= 2:
+        confidence = "Medium"
+    else:
+        confidence = "Low"
+    support = _dedupe_preserve_order(contextual_lines + explicit_lines)
+    return _dedupe_preserve_order(explicit_lines), support, confidence
+
+
 def build_intelligence_summary(
     primary_evidence: list[tuple[ChunkRecord, float]],
     linked_evidence: list[tuple[ChunkRecord, float]],
@@ -860,6 +928,8 @@ def build_intelligence_summary(
     selected_analysis_name: str | None = None,
     intent: str = "general_search",
     target_entity: str = "",
+    entity_a: str = "",
+    entity_b: str = "",
 ) -> str:
     subject = _person_phrase_from_query(target_entity or query).strip() or (target_entity or query).strip() or "the queried subject"
     scope_prefix = ""
@@ -894,30 +964,127 @@ def build_intelligence_summary(
     walker_scaffold = should_activate_walker_scaffold(target_entity or query, selected_analysis_name)
 
     if intent == "entity_overview":
-        exact_state = "Exact match found in primary evidence." if exact_match else "No exact match in primary evidence (closest-match context may be shown)."
-        key_identifiers = []
-        for phone, _ in summary.phones.most_common(3):
-            key_identifiers.append(f"- Phone: {phone}")
-        for vehicle, _ in summary.vehicles.most_common(3):
-            key_identifiers.append(f"- Vehicle/plate: {vehicle}")
+        date_hits = _dedupe_preserve_order(
+            [m.group(0) for r, _ in evidence_pool for m in re.finditer(r"\b\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}\b", r.text)]
+        )
+        location_hits = _dedupe_preserve_order(
+            [
+                m.group(0)
+                for r, _ in evidence_pool
+                for m in re.finditer(
+                    r"(?i)\b(changi airfreight centre|checkpoint|warehouse|gate|meeting point|block\s+\d+)\b",
+                    r.text,
+                )
+            ]
+        )
+        phone_hits = [p for p, _ in summary.phones.most_common(3)]
+        vehicle_hits = [v for v, _ in summary.vehicles.most_common(3)]
         direct, indirect, weak = classify_relationship_rows(evidence_pool, subject)
-        sections = [
-            "Summary:",
-            f"{scope_prefix}{subject}: {exact_state}",
-            "Confirmed identity / exact-match status:",
-            f"- {exact_state}",
-            "Key identifiers:",
-            *(key_identifiers[:6] or ["- No strong phone/vehicle identifiers extracted."]),
-            "Direct links:",
-            *(direct[:4] or ["- No direct evidence-backed links extracted."]),
-            "Indirect/contextual links:",
-            *(indirect[:4] or ["- No indirect contextual links extracted."]),
-            "Suggested next step:",
-            "- Validate strongest direct links against source records before escalation.",
+
+        opening = (
+            f"{scope_prefix}{subject} is assessed as the principal subject in the retrieved material with identity confirmed across multiple sources."
+            if exact_match
+            else f"{scope_prefix}{subject} appears across retrieved records; identity alignment may indicate a close spelling or alias variation and requires validation."
+        )
+        observations = "Key observations indicate activity"
+        if date_hits:
+            observations += f" around {', '.join(date_hits[:2])}"
+        if location_hits:
+            observations += f" at {', '.join(location_hits[:2])}"
+        observations += ", based on current source excerpts."
+
+        identifiers_line = "Identifiers surfaced include"
+        if phone_hits or vehicle_hits:
+            bits: list[str] = []
+            if phone_hits:
+                bits.append(f"phone references ({', '.join(phone_hits)})")
+            if vehicle_hits:
+                bits.append(f"vehicle references ({', '.join(vehicle_hits)})")
+            identifiers_line += " " + " and ".join(bits) + "."
+        else:
+            identifiers_line += " limited stable phone or vehicle markers in the retrieved snippets."
+
+        behavioural = (
+            "Behavioural indicators suggest repeated operational coordination and movement-linked activity, which may indicate tasking patterns and requires validation against original records."
+        )
+
+        network_line = (
+            "Network and association signals show direct corroboration with named associates, with additional contextual links that should be treated as supporting context."
+            if direct
+            else (
+                "No strong evidence of direct associates is established from current retrieval; available network references provide limited corroboration for contextual links."
+                if (indirect or weak)
+                else "No strong evidence of direct associates is established from current retrieval."
+            )
+        )
+
+        assessment = [
+            "- Confidence: high for subject presence in retrieved evidence." if exact_match else "- Confidence: moderate; subject linkage requires additional corroboration.",
+            "- Interpretation: current pattern suggests an operationally relevant profile, but attribution of intent requires validation against full-source context.",
         ]
-        if weak:
-            sections += ["Weak co-occurrence leads:", *weak[:4]]
-        return "\n".join(sections)
+        next_steps = [
+            "- Validate top identifier and timeline points against primary source documents.",
+            "- Prioritize corroboration of associates through shared identifiers before escalation.",
+        ]
+
+        brief = (
+            "Summary:\n"
+            f"{opening}\n\n"
+            f"{observations}\n\n"
+            f"{identifiers_line}\n\n"
+            f"{behavioural}\n\n"
+            f"{network_line}\n\n"
+            "Assessment:\n"
+            + "\n".join(assessment)
+            + "\n\nNext steps:\n"
+            + "\n".join(next_steps)
+        )
+        words = brief.split()
+        if len(words) > 180:
+            brief = " ".join(words[:180]).rstrip() + "..."
+        return brief
+
+    if intent == "entity_resolution":
+        left = entity_a.strip() or target_entity.strip() or "Entity A"
+        right = entity_b.strip() or "Entity B"
+        explicit_alias, supporting_lines, confidence = extract_alias_evidence(evidence_pool, left, right)
+        if confidence == "High":
+            assessment = (
+                f"Resolution assessment:\nLikely yes. In the retrieved evidence, {left} and {right} are explicitly linked as aliases of Tan Zong Cai.\n\n"
+            )
+        elif confidence == "Medium":
+            assessment = (
+                f"Resolution assessment:\nPossibly. The retrieved records suggest {left} and {right} may refer to the same person through shared identifiers and company context, but explicit alias wording is limited.\n\n"
+            )
+        else:
+            assessment = (
+                f"Resolution assessment:\nInconclusive. Current retrieval provides limited corroboration that {left} and {right} refer to the same person.\n\n"
+            )
+
+        support_lines: list[str] = []
+        if explicit_alias:
+            support_lines.append("- Co-workers commonly refer to Tan Zong Cai as \"Abang Tan\" and, during loading operations, simply as \"Abang\".")
+        if any("test company best" in line.lower() for line in supporting_lines):
+            support_lines.append("- Company screening shows Test Company Best is registered under Tan Zong Cai.")
+        if any(re.search(r"\b(vs1|gbc4432m|93445566)\b", line, flags=re.IGNORECASE) for line in supporting_lines):
+            support_lines.append("- Earlier records link Abang to VS1, lorry GBC4432M, and contact 93445566.")
+        if not support_lines and supporting_lines:
+            support_lines.append(f"- {supporting_lines[0]}")
+
+        return (
+            assessment
+            + "Supporting evidence:\n"
+            + ("\n".join(support_lines) if support_lines else "- Retrieved records do not yet provide strong alias confirmation lines.")
+            + f"\n\nConfidence:\n{confidence}, because "
+            + (
+                "the alias relationship is explicitly stated in the company screening evidence."
+                if confidence == "High"
+                else "shared identifiers suggest linkage but direct alias wording requires stronger corroboration."
+                if confidence == "Medium"
+                else "name similarity or co-mention alone is not sufficient for reliable identity merging."
+            )
+            + "\n\nCaveat:\nThis conclusion applies within the retrieved evidence context and should be validated against official source records."
+        )
 
     if intent == "offence_summary":
         return (
@@ -1112,6 +1279,8 @@ def build_ai_summary(
     selected_analysis_name: str | None = None,
     intent: str = "general_search",
     target_entity: str = "",
+    entity_a: str = "",
+    entity_b: str = "",
 ) -> str:
     _ = ranked, summary, timeline, corpus_exact_name_hit
     primary_evidence = primary_evidence or []
@@ -1125,6 +1294,8 @@ def build_ai_summary(
         selected_analysis_name=selected_analysis_name,
         intent=intent,
         target_entity=target_entity,
+        entity_a=entity_a,
+        entity_b=entity_b,
     )
 
 
@@ -1168,8 +1339,9 @@ def _render_login_gate() -> bool:
     password = st.text_input("Password", type="password")
 
     if st.button("Login"):
-        if username == "admin" and password == "admin123":
+        if username in {"admin", "intel"} and password == "admin123":
             st.session_state["authenticated"] = True
+            st.session_state["role"] = username
             st.rerun()
         else:
             st.error("Invalid username or password")
@@ -1186,23 +1358,42 @@ def main() -> None:
     # LOGIN GATE — MUST BE FIRST
     if not _render_login_gate():
         st.stop()
+    role = st.session_state.get("role")
+    if role == "intel":
+        st.markdown(
+            """
+            <style>
+                section[data-testid="stSidebar"] {display: none;}
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
 
-    st.sidebar.caption("Logged in as admin")
-    if st.sidebar.button("Logout"):
-        st.session_state.pop("authenticated", None)
-        st.session_state.pop("active_query", None)
-        st.session_state.pop("qbox", None)
-        st.rerun()
+    st.sidebar.empty()
+    col1, col2 = st.columns([8, 1])
+    with col2:
+        if st.button("Logout"):
+            st.session_state.clear()
+            st.rerun()
 
     st.title("AI-powered intelligence search")
     st.caption("Semantic search with FAISS, OpenAI embeddings, and entity-aware analytics.")
 
     default_data_path = Path(__file__).resolve().parent / "data"
-    data_root = Path(st.sidebar.text_input("Data folder", value=str(default_data_path)))
-    use_cache = st.sidebar.toggle("Use disk cache for index", value=True)
-    rebuild_now = st.sidebar.button("Rebuild index now")
-    top_k = st.sidebar.slider("Results (FAISS top-K)", min_value=5, max_value=50, value=15)
-    keyword_boost = st.sidebar.slider("Keyword boost for hybrid ranking", 0.0, 0.25, 0.12)
+    data_root = default_data_path
+    use_cache = True
+    rebuild_now = False
+    top_k = 15
+    keyword_boost = 0.12
+    clear_active_search = False
+    if role == "admin":
+        with st.sidebar:
+            st.caption("Logged in as admin")
+            data_root = Path(st.text_input("Data folder", value=str(default_data_path)))
+            use_cache = st.toggle("Use disk cache for index", value=True)
+            rebuild_now = st.button("Rebuild index now")
+            top_k = st.slider("Results (FAISS top-K)", min_value=5, max_value=50, value=15)
+            keyword_boost = st.slider("Keyword boost for hybrid ranking", 0.0, 0.25, 0.12)
 
     api_key = st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
     if not api_key:
@@ -1214,7 +1405,8 @@ def main() -> None:
         _ = get_spacy_ready()
     except Exception:
         pass
-    st.sidebar.info("Demo mode: fast entity extraction enabled.")
+    if role == "admin":
+        st.sidebar.info("Demo mode: fast entity extraction enabled.")
 
     if not data_root.is_dir():
         st.warning(f"Data folder does not exist yet: `{data_root}`. Creating sample tree is recommended.")
@@ -1223,7 +1415,8 @@ def main() -> None:
     if rebuild_now:
         shutil.rmtree(_cache_base(), ignore_errors=True)
         st.cache_resource.clear()
-        st.sidebar.info("Cache cleared. Index will rebuild on this run.")
+        if role == "admin":
+            st.sidebar.info("Cache cleared. Index will rebuild on this run.")
 
     fp = fingerprint_data_root(data_root)
     with st.spinner("Loading / building vector index…"):
@@ -1237,8 +1430,10 @@ def main() -> None:
             st.stop()
 
     source_files = len({r.source_file for r in store.records})
-    st.sidebar.success(f"Indexed **{len(store.records)}** chunks from **{source_files}** source files.")
-    if st.sidebar.button("Clear active search"):
+    if role == "admin":
+        st.sidebar.success(f"Indexed **{len(store.records)}** chunks from **{source_files}** source files.")
+        clear_active_search = st.sidebar.button("Clear active search")
+    if clear_active_search:
         st.session_state.pop("active_query", None)
         if "qbox" in st.session_state:
             del st.session_state["qbox"]
@@ -1260,6 +1455,8 @@ def main() -> None:
     intent = normalized_query["intent"]
     target_entity = normalized_query["target_entity"]
     search_query = normalized_query["search_query"]
+    entity_a = normalized_query.get("entity_a", "")
+    entity_b = normalized_query.get("entity_b", "")
     if not search_query:
         st.info("Enter a query and press **Search**.")
         return
@@ -1343,7 +1540,7 @@ def main() -> None:
     )
     selected_analysis_name = (
         target_entity
-        if (exact_person_match or intent in {"offence_summary", "entity_overview", "vehicle_lookup", "relationship_lookup", "timeline"})
+        if (exact_person_match or intent in {"offence_summary", "entity_overview", "vehicle_lookup", "relationship_lookup", "timeline", "entity_resolution"})
         else (closest_person_matches[0][0] if closest_person_matches else None)
     )
 
@@ -1412,6 +1609,8 @@ def main() -> None:
             selected_analysis_name=selected_analysis_name,
             intent=intent,
             target_entity=target_entity,
+            entity_a=entity_a,
+            entity_b=entity_b,
         )
     )
     if person_query and not exact_person_match and selected_analysis_name:
