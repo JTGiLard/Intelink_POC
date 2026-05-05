@@ -751,6 +751,113 @@ def _extract_phone_mentions(text: str) -> list[str]:
     return _dedupe_preserve_order(found)
 
 
+def normalize_person_aliases(
+    person_entities: list[str],
+    evidence_pool: list[tuple[ChunkRecord, float]],
+) -> dict[str, str]:
+    alias_map: dict[str, str] = {}
+    if not person_entities or not evidence_pool:
+        return alias_map
+
+    normalized_people = _dedupe_preserve_order([p for p in person_entities if p.strip()])
+    canonical_candidates = [p for p in normalized_people if len(p.split()) >= 2]
+    if not canonical_candidates:
+        return alias_map
+
+    alias_candidates = [
+        p
+        for p in normalized_people
+        if p.lower().startswith("subject ") or len(p.split()) == 1
+    ]
+    if not alias_candidates:
+        return alias_map
+
+    evidence_by_person: dict[str, dict[str, set[str] | int]] = {}
+    for person in normalized_people:
+        evidence_by_person[person] = {
+            "phones": set(),
+            "vehicles": set(),
+            "chunks": set(),
+            "mentions": 0,
+        }
+
+    for r, _ in evidence_pool:
+        ents = extract_all_entities(r.text)
+        chunk_persons = {h.text.strip() for h in ents if h.label == "person" and h.text.strip()}
+        chunk_phones = {h.text.strip() for h in ents if h.label == "phone" and h.text.strip()}
+        chunk_vehicles = {h.text.strip() for h in ents if h.label == "vehicle" and h.text.strip()}
+        for person in chunk_persons:
+            if person not in evidence_by_person:
+                continue
+            evidence_by_person[person]["mentions"] = int(evidence_by_person[person]["mentions"]) + 1
+            cast_chunks = evidence_by_person[person]["chunks"]
+            cast_phones = evidence_by_person[person]["phones"]
+            cast_vehicles = evidence_by_person[person]["vehicles"]
+            if isinstance(cast_chunks, set):
+                cast_chunks.add(r.chunk_id)
+            if isinstance(cast_phones, set):
+                cast_phones |= chunk_phones
+            if isinstance(cast_vehicles, set):
+                cast_vehicles |= chunk_vehicles
+
+    for alias in alias_candidates:
+        best_name: str | None = None
+        best_score = 0.0
+        alias_info = evidence_by_person.get(alias, {})
+        alias_phone = alias_info.get("phones", set())
+        alias_vehicle = alias_info.get("vehicles", set())
+        alias_chunks = alias_info.get("chunks", set())
+        for candidate in canonical_candidates:
+            if candidate == alias:
+                continue
+            cand_info = evidence_by_person.get(candidate, {})
+            score = 0.0
+            if isinstance(alias_phone, set) and isinstance(cand_info.get("phones"), set):
+                if alias_phone & cand_info.get("phones", set()):
+                    score += 3.0
+            if isinstance(alias_vehicle, set) and isinstance(cand_info.get("vehicles"), set):
+                if alias_vehicle & cand_info.get("vehicles", set()):
+                    score += 3.0
+            if isinstance(alias_chunks, set) and isinstance(cand_info.get("chunks"), set):
+                if alias_chunks & cand_info.get("chunks", set()):
+                    score += 2.0
+            score += _fuzzy_person_similarity(alias.replace("Subject ", "").strip(), candidate) * 2.0
+            if score > best_score:
+                best_score = score
+                best_name = candidate
+        if best_name and best_score >= 4.0:
+            alias_map[alias] = best_name
+    return alias_map
+
+
+def apply_person_alias_map_to_ranked(
+    ranked: list[tuple[ChunkRecord, float]],
+    alias_map: dict[str, str],
+) -> list[tuple[ChunkRecord, float]]:
+    if not alias_map:
+        return list(ranked)
+    updated: list[tuple[ChunkRecord, float]] = []
+    for r, s in ranked:
+        new_text = r.text
+        for alias, canonical in alias_map.items():
+            new_text = re.sub(rf"(?i)\b{re.escape(alias)}\b", canonical, new_text)
+        if new_text == r.text:
+            updated.append((r, s))
+            continue
+        updated_record = ChunkRecord(
+            chunk_id=r.chunk_id,
+            doc_id=r.doc_id,
+            source_type=r.source_type,
+            doc_title=r.doc_title,
+            source_file=r.source_file,
+            text=new_text,
+            char_start=r.char_start,
+            doc_occurred_at=r.doc_occurred_at,
+        )
+        updated.append((updated_record, s))
+    return updated
+
+
 RELATIONSHIP_VERB_PATTERNS = {
     "VEHICLE_USED_IN_CASE": re.compile(
         r"(?i)(driving|drove|arrived in|bearing plate|vehicle used|loaded into|transported using)"
@@ -980,65 +1087,60 @@ def build_intelligence_summary(
         phone_hits = [p for p, _ in summary.phones.most_common(3)]
         vehicle_hits = [v for v, _ in summary.vehicles.most_common(3)]
         direct, indirect, weak = classify_relationship_rows(evidence_pool, subject)
+        subject_parts = [p for p in re.split(r"\s+", subject.lower()) if p]
+        alias_like_names = [
+            name
+            for name, _cnt in summary.persons.most_common(12)
+            if name.strip()
+            and name.strip().lower() != subject.lower()
+            and any(sp in name.lower() for sp in subject_parts[:1])
+            and len(name.split()) <= 2
+        ]
 
         opening = (
-            f"{scope_prefix}{subject} is assessed as the principal subject in the retrieved material with identity confirmed across multiple sources."
+            f"{scope_prefix}{subject} is assessed as the primary subject in the retrieved material, with strong confidence where name references are repeated across sources."
             if exact_match
-            else f"{scope_prefix}{subject} appears across retrieved records; identity alignment may indicate a close spelling or alias variation and requires validation."
+            else f"{scope_prefix}{subject} is assessed as a likely subject in the retrieved material, though identity attribution still requires confirmation against official records."
         )
-        observations = "Key observations indicate activity"
+        if alias_like_names:
+            opening += f" {alias_like_names[0]} appears to refer to the same individual but requires confirmation."
+
         if date_hits:
-            observations += f" around {', '.join(date_hits[:2])}"
-        if location_hits:
-            observations += f" at {', '.join(location_hits[:2])}"
-        observations += ", based on current source excerpts."
-
-        identifiers_line = "Identifiers surfaced include"
-        if phone_hits or vehicle_hits:
-            bits: list[str] = []
-            if phone_hits:
-                bits.append(f"phone references ({', '.join(phone_hits)})")
-            if vehicle_hits:
-                bits.append(f"vehicle references ({', '.join(vehicle_hits)})")
-            identifiers_line += " " + " and ".join(bits) + "."
+            activity = f"Observations indicate activity across {', '.join(date_hits[:3])}"
         else:
-            identifiers_line += " limited stable phone or vehicle markers in the retrieved snippets."
+            activity = "Observations indicate recurring activity across the retrieved reporting period"
+        if location_hits:
+            activity += f", with location references including {', '.join(location_hits[:2])}"
+        activity += "."
 
-        behavioural = (
-            "Behavioural indicators suggest repeated operational coordination and movement-linked activity, which may indicate tasking patterns and requires validation against original records."
+        if phone_hits or vehicle_hits:
+            id_parts: list[str] = []
+            if phone_hits:
+                id_parts.append(f"contact numbers {', '.join(phone_hits)}")
+            if vehicle_hits:
+                id_parts.append(f"vehicle references {', '.join(vehicle_hits)}")
+            identifiers_line = "Identifiers linked to this profile include " + " and ".join(id_parts) + "."
+        else:
+            identifiers_line = "Only limited stable phone or vehicle identifiers are visible in the retrieved extracts."
+
+        if direct:
+            assoc_line = "Associations are evidence-backed through repeated co-mentions with named counterparts in operational context."
+        elif indirect:
+            assoc_line = "Association signals are mainly contextual and may suggest network proximity rather than confirmed direct coordination."
+        else:
+            assoc_line = "Association coverage remains limited in the current retrieval set."
+
+        interpretation = (
+            "Analytically, the pattern may suggest coordinated operational activity, but motive and role assignment require validation against full-source records."
+        )
+        if weak:
+            interpretation += " Additional weak-name links appear in text and should be treated as provisional until corroborated."
+
+        next_steps = (
+            "Recommended next steps: validate timeline markers and key identifiers against primary records, then corroborate named associations through shared phone, vehicle, or company references."
         )
 
-        network_line = (
-            "Network and association signals show direct corroboration with named associates, with additional contextual links that should be treated as supporting context."
-            if direct
-            else (
-                "No strong evidence of direct associates is established from current retrieval; available network references provide limited corroboration for contextual links."
-                if (indirect or weak)
-                else "No strong evidence of direct associates is established from current retrieval."
-            )
-        )
-
-        assessment = [
-            "- Confidence: high for subject presence in retrieved evidence." if exact_match else "- Confidence: moderate; subject linkage requires additional corroboration.",
-            "- Interpretation: current pattern suggests an operationally relevant profile, but attribution of intent requires validation against full-source context.",
-        ]
-        next_steps = [
-            "- Validate top identifier and timeline points against primary source documents.",
-            "- Prioritize corroboration of associates through shared identifiers before escalation.",
-        ]
-
-        brief = (
-            "Summary:\n"
-            f"{opening}\n\n"
-            f"{observations}\n\n"
-            f"{identifiers_line}\n\n"
-            f"{behavioural}\n\n"
-            f"{network_line}\n\n"
-            "Assessment:\n"
-            + "\n".join(assessment)
-            + "\n\nNext steps:\n"
-            + "\n".join(next_steps)
-        )
+        brief = "\n\n".join([opening, activity, identifiers_line, assoc_line, interpretation, next_steps])
         words = brief.split()
         if len(words) > 180:
             brief = " ".join(words[:180]).rstrip() + "..."
@@ -1511,6 +1613,16 @@ def main() -> None:
     qv = embed_texts([search_query])
     raw_hits = store.search(qv[0], k=top_k)
     ranked_semantic = hybrid_rank(raw_hits, search_query, keyword_boost=keyword_boost)
+    person_entities: list[str] = []
+    for rec, _score in ranked_semantic:
+        person_entities.extend(
+            [h.text.strip() for h in extract_all_entities(rec.text) if h.label == "person" and h.text.strip()]
+        )
+    alias_map = normalize_person_aliases(person_entities, ranked_semantic)
+    if alias_map:
+        ranked_semantic = apply_person_alias_map_to_ranked(ranked_semantic, alias_map)
+        for alias, canonical in alias_map.items():
+            st.caption(f"Alias normalized: {alias} -> {canonical}")
     summary_semantic, edges_semantic, timeline_semantic = aggregate_dashboard(ranked_semantic, search_query)
 
     ranked = ranked_semantic
