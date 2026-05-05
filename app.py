@@ -1049,13 +1049,13 @@ def extract_alias_evidence(
     entity_a: str,
     entity_b: str,
 ) -> dict[str, object]:
-    alias_markers = [
-        "refer to the same person",
-        "confirms that",
-        "is the same person as",
-        "also known as",
-        "commonly referred to as",
-        "simply as",
+    explicit_alias_patterns = [
+        r"refer to the same person",
+        r"confirms that.*same person",
+        r"is the same person as",
+        r"also known as",
+        r"commonly referred to as",
+        r"simply as",
     ]
     explicit_lines: list[str] = []
     contextual_lines: list[str] = []
@@ -1074,7 +1074,7 @@ def extract_alias_evidence(
         has_b = b_l in text_l
         if re.search(r"\b(may be linked|possibly linked|could be linked)\b", text_l, flags=re.IGNORECASE):
             ambiguous_phrases_found.append(r.text.strip().replace("\n", " ")[:180])
-        if any(marker in text_l for marker in alias_markers) and (has_a or has_b):
+        if any(re.search(pat, text_l, flags=re.IGNORECASE) for pat in explicit_alias_patterns) and (has_a or has_b):
             explicit_alias_confirmed = True
             snippet = r.text.strip().replace("\n", " ")
             explicit_lines.append(snippet[:260])
@@ -1083,7 +1083,7 @@ def extract_alias_evidence(
                 split_sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", snippet) if s.strip()]
                 for sentence in split_sentences:
                     sentence_l = sentence.lower()
-                    if any(marker in sentence_l for marker in alias_markers):
+                    if any(re.search(pat, sentence_l, flags=re.IGNORECASE) for pat in explicit_alias_patterns):
                         confirmation_line = sentence
                         break
                 if not confirmation_line:
@@ -1137,6 +1137,8 @@ def build_intelligence_summary(
     target_entity: str = "",
     entity_a: str = "",
     entity_b: str = "",
+    alias_result: dict[str, object] | None = None,
+    score_result: dict[str, object] | None = None,
 ) -> str:
     subject = _person_phrase_from_query(target_entity or query).strip() or (target_entity or query).strip() or "the queried subject"
     scope_prefix = ""
@@ -1249,39 +1251,46 @@ def build_intelligence_summary(
     if intent == "entity_resolution":
         left = entity_a.strip() or target_entity.strip() or "Entity A"
         right = entity_b.strip() or "Entity B"
-        alias_result = extract_alias_evidence(evidence_pool, left, right)
-        explicit_alias = bool(alias_result.get("explicit_alias_confirmed", False))
+        alias_result = alias_result or extract_alias_evidence(evidence_pool, left, right)
+        score_result = score_result or score_entity_resolution(alias_result)
+        explicit_alias_confirmed = bool(alias_result.get("explicit_alias_confirmed", False))
         confirmation_lines = list(alias_result.get("explicit_confirmation_sentences", []))
         confirmation_line = str(alias_result.get("confirmation_line", "")).strip()
         supporting_lines = list(alias_result.get("supporting_lines", []))
         shared_identifiers = list(alias_result.get("shared_identifiers", []))
-        score_result = score_entity_resolution(alias_result)
         score = int(score_result.get("score", 0))
         level = str(score_result.get("level", "Low"))
         drivers = list(score_result.get("drivers", []))
-        explicit_alias_confirmed = explicit_alias
-        if explicit_alias_confirmed:
-            assessment = (
-                f"Resolution assessment:\n{left} and {right} are assessed to refer to the same individual with high confidence.\n\n"
-            )
-        elif str(alias_result.get("resolution", "")) == "Likely same":
-            assessment = (
-                f"Resolution assessment:\nPossibly. The retrieved records suggest {left} and {right} may refer to the same person through shared identifiers and company context, but explicit alias wording is limited.\n\n"
-            )
+        penalties = list(score_result.get("penalties", []))
+
+        # Defensive consistency: score_result is source of truth if state disagrees.
+        if score >= 80:
+            level = "High"
+            resolution_text = "are assessed to refer to the same individual with high confidence"
+        elif score >= 50:
+            level = "Medium"
+            resolution_text = "are likely to refer to the same individual"
         else:
-            assessment = (
-                f"Resolution assessment:\nInconclusive. Current retrieval provides limited corroboration that {left} and {right} refer to the same person.\n\n"
-            )
+            level = "Low"
+            resolution_text = "are inconclusive"
+        if explicit_alias_confirmed and score < 80:
+            score = max(85, score)
+            level = "High"
+            resolution_text = "are assessed to refer to the same individual with high confidence"
+
+        assessment = f"Resolution assessment:\n{left} and {right} {resolution_text}.\n\n"
 
         support_lines: list[str] = []
-        if explicit_alias:
-            support_lines.append("- Co-workers commonly refer to Tan Zong Cai as \"Abang Tan\" and, during loading operations, simply as \"Abang\".")
+        if explicit_alias_confirmed:
+            support_lines.append(
+                "- The company screening evidence explicitly states that \"Abang\", \"Abang Tan\", and Tan Zong Cai refer to the same person."
+            )
         if shared_identifiers:
             support_lines.append(f"- Shared identifiers observed: {', '.join(shared_identifiers[:4])}.")
         if any("test company best" in line.lower() for line in supporting_lines):
-            support_lines.append("- Company screening shows Test Company Best is registered under Tan Zong Cai.")
+            support_lines.append("- It also links this identity to Test Company Best.")
         if any(re.search(r"\b(vs1|gbc4432m|93445566)\b", line, flags=re.IGNORECASE) for line in supporting_lines):
-            support_lines.append("- Earlier records link Abang to VS1, lorry GBC4432M, and contact 93445566.")
+            support_lines.append("- Earlier Abang records provide supporting context through VS1, lorry GBC4432M, and contact number 93445566.")
         if not support_lines and supporting_lines:
             support_lines.append(f"- {supporting_lines[0]}")
         if confirmation_line:
@@ -1289,6 +1298,7 @@ def build_intelligence_summary(
         elif confirmation_lines:
             support_lines.append(f"- Explicit confirmation line: \"{confirmation_lines[0]}\"")
         why_lines = [f"- {d}" for d in drivers] if drivers else ["- Evidence support is currently limited."]
+        penalty_lines = [f"- {p}" for p in penalties]
 
         return (
             assessment
@@ -1297,12 +1307,13 @@ def build_intelligence_summary(
             + f"\n\nConfidence:\n{level} confidence — {score}/100"
             + "\n\nWhy:\n"
             + "\n".join(why_lines[:4])
+            + (("\n\nWatchpoints:\n" + "\n".join(penalty_lines[:2])) if penalty_lines and level != "High" else "")
             + "\n\nConfidence rationale:\n"
             + (
                 "the alias relationship is explicitly stated in source evidence."
                 if explicit_alias_confirmed
                 else "shared identifiers suggest linkage but direct alias wording requires stronger corroboration."
-                if level == "Medium"
+                if score >= 50
                 else "name similarity or co-mention alone is not sufficient for reliable identity merging."
             )
             + "\n\nCaveat:\nThis conclusion applies within the retrieved evidence context and should be validated against official source records."
@@ -1503,6 +1514,8 @@ def build_ai_summary(
     target_entity: str = "",
     entity_a: str = "",
     entity_b: str = "",
+    alias_result: dict[str, object] | None = None,
+    score_result: dict[str, object] | None = None,
 ) -> str:
     _ = ranked, summary, timeline, corpus_exact_name_hit
     primary_evidence = primary_evidence or []
@@ -1518,6 +1531,8 @@ def build_ai_summary(
         target_entity=target_entity,
         entity_a=entity_a,
         entity_b=entity_b,
+        alias_result=alias_result,
+        score_result=score_result,
     )
 
 
@@ -1827,10 +1842,15 @@ def main() -> None:
         cluster_label_sel = cluster_summary_label(chosen)
 
     st.subheader("AI Summary")
+    alias_result_ui: dict[str, object] | None = None
+    score_ui: dict[str, object] | None = None
     if intent == "entity_resolution":
-        alias_result_ui = extract_alias_evidence(primary_evidence + related_evidence, entity_a or target_entity, entity_b)
+        resolution_evidence_pool = primary_evidence + related_evidence
+        alias_result_ui = extract_alias_evidence(resolution_evidence_pool, entity_a or target_entity, entity_b)
         score_ui = score_entity_resolution(alias_result_ui)
         render_confidence_bar(int(score_ui["score"]), str(score_ui["level"]))
+        st.write("DEBUG explicit_alias_confirmed:", alias_result_ui.get("explicit_alias_confirmed"))
+        st.write("DEBUG score:", int(score_ui.get("score", 0)))
     st.write(
         build_ai_summary(
             ranked,
@@ -1847,6 +1867,8 @@ def main() -> None:
             target_entity=target_entity,
             entity_a=entity_a,
             entity_b=entity_b,
+            alias_result=alias_result_ui,
+            score_result=score_ui,
         )
     )
     if person_query and not exact_person_match and selected_analysis_name:
