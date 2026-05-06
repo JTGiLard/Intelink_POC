@@ -112,6 +112,45 @@ def format_linking_id_key(k: str) -> str:
     return f"{prefix.replace('_', ' ').title()}: {rest}"
 
 
+@dataclass(frozen=True)
+class IdentifierRef:
+    source_file: str
+    chunk_id: str
+
+
+@dataclass
+class IdentifierProvenance:
+    """Grounds a linking identifier to cluster snippets only (filename + chunk id)."""
+
+    linking_key: str
+    refs: list[IdentifierRef] = field(default_factory=list)
+
+
+def build_identifier_provenance_for_cluster(chunks: list[tuple[Any, float]]) -> list[IdentifierProvenance]:
+    """Collect identifiers solely from text of chunks in this cluster; no global retrieval."""
+    key_to_refs: dict[str, dict[tuple[str, str], None]] = defaultdict(dict)
+    for r, _ in chunks:
+        for k in extract_linking_identifiers(r.text):
+            key_to_refs[k][(r.source_file, r.chunk_id)] = None
+    out: list[IdentifierProvenance] = []
+    for k in sorted(key_to_refs):
+        pairs = sorted(key_to_refs[k])
+        out.append(
+            IdentifierProvenance(
+                linking_key=k,
+                refs=[IdentifierRef(source_file=sf, chunk_id=cid) for sf, cid in pairs],
+            )
+        )
+    return out
+
+
+def format_identifier_provenance_line(p: IdentifierProvenance) -> str:
+    label = format_linking_id_key(p.linking_key)
+    files = sorted({ref.source_file for ref in p.refs})
+    file_part = ", ".join(files) if files else "unknown source"
+    return f"{label} — from {file_part}"
+
+
 @dataclass
 class IdentityCluster:
     """A connected component of name mentions linked by shared non-person identifiers."""
@@ -121,6 +160,7 @@ class IdentityCluster:
     linking_ids: set[str]
     confidence: str
     is_unlinked: bool
+    identifier_provenance: list[IdentifierProvenance] = field(default_factory=list)
 
 
 @dataclass
@@ -210,13 +250,16 @@ def build_person_identity_clusters(
             unlinked_rows.append(comp)
         else:
             conf = _cluster_confidence(comp, uids)
+            prov = build_identifier_provenance_for_cluster(comp)
+            grounded_ids = {p.linking_key for p in prov}
             linked_clusters.append(
                 IdentityCluster(
                     display_index=0,
                     chunks=comp,
-                    linking_ids=uids,
+                    linking_ids=grounded_ids,
                     confidence=conf,
                     is_unlinked=False,
+                    identifier_provenance=prov,
                 )
             )
 
@@ -236,6 +279,7 @@ def build_person_identity_clusters(
             linking_ids=set(),
             confidence="Low",
             is_unlinked=True,
+            identifier_provenance=[],
         )
         for comp in unlinked_rows
     ]
