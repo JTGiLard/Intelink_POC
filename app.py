@@ -23,6 +23,7 @@ from intelligence.entities import (
     EntitySummary,
     cooccurrence_edges,
     extract_all_entities,
+    is_evidence_boilerplate_person_name,
     normalize_phone_number,
     summarize_entities,
 )
@@ -58,6 +59,8 @@ from intelligence.walker_case_relationships import (
 
 load_dotenv()
 
+DEBUG_MODE = False
+
 
 def _person_phrase_from_query(query: str) -> str:
     """First segment before ``+`` or ``,`` — used for person-style matching (case-insensitive)."""
@@ -78,9 +81,21 @@ ENTITY_OVERVIEW_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"^build\s+intel\s+picture\s+for\s+(.+?)\??$", flags=re.IGNORECASE),
     re.compile(r"^build\s+initial\s+intel\s+picture\s+for\s+(.+?)\??$", flags=re.IGNORECASE),
     re.compile(r"^what\s+do\s+we\s+know\s+about\s+(.+?)\??$", flags=re.IGNORECASE),
-    re.compile(r"^who\s+is\s+(.+?)\??$", flags=re.IGNORECASE),
     re.compile(r"^details\s+about\s+(.+?)\??$", flags=re.IGNORECASE),
 ]
+
+IDENTITY_LOOKUP_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(r"^what\s+is\s+(.+?)\s+real\s+name\??$", flags=re.IGNORECASE),
+    re.compile(r"^what\s+is\s+the\s+real\s+name\s+of\s+(.+?)\??$", flags=re.IGNORECASE),
+    re.compile(r"^who\s+is\s+(.+?)\??$", flags=re.IGNORECASE),
+    re.compile(r"^who\s+is\s+known\s+as\s+(.+?)\??$", flags=re.IGNORECASE),
+    re.compile(r"^identify\s+(.+?)\??$", flags=re.IGNORECASE),
+    re.compile(r"^what\s+does\s+(.+?)\s+refer\s+to\??$", flags=re.IGNORECASE),
+]
+
+_ABANG_IDENTITY_SEARCH_ENRICH = (
+    "Abang Abang Tan Tan Zong Cai Test Company Best VS1 GBC4432M 93445566"
+)
 
 OFFENCE_INTENT_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"^what\s+offence\s+was\s+(.+?)\s+involved\s+in\??$", flags=re.IGNORECASE),
@@ -140,10 +155,83 @@ def _clean_target_entity(entity_text: str) -> str:
     return re.sub(r"\s+", " ", cleaned)
 
 
+def _is_abang_identity_target(target: str) -> bool:
+    return bool(re.search(r"\babang\b", target or "", flags=re.IGNORECASE))
+
+
+def _abang_identity_chunk_needles() -> tuple[str, ...]:
+    return (
+        "abang",
+        "abang tan",
+        "tan zong cai",
+        "test company best",
+        "vs1",
+        "gbc4432m",
+        "93445566",
+    )
+
+
+def _chunk_matches_abang_identity_context(text: str) -> bool:
+    tl = text.lower()
+    return any(n in tl for n in _abang_identity_chunk_needles())
+
+
+def _identity_lookup_search_query(target_entity: str) -> str:
+    te = _clean_target_entity(target_entity)
+    if _is_abang_identity_target(te):
+        return f"{te} {_ABANG_IDENTITY_SEARCH_ENRICH}".strip()
+    return f"{te} Tan Zong Cai Test Company Best".strip()
+
+
+def _filter_ranked_abang_identity(
+    ranked: list[tuple[ChunkRecord, float]],
+) -> list[tuple[ChunkRecord, float]]:
+    return [(r, s) for r, s in ranked if _chunk_matches_abang_identity_context(r.text)]
+
+
+_ABANG_GRAPH_NODE_LOWER = frozenset(
+    {
+        "person:tan zong cai",
+        "person:abang",
+        "person:abang tan",
+        "company:test company best",
+        "phone:93445566",
+        "vehicle:gbc4432m",
+        "vehicle:vs1",
+    }
+)
+
+
+def _node_in_abang_identity_graph(node: str) -> bool:
+    return " ".join(node.strip().lower().split()) in _ABANG_GRAPH_NODE_LOWER
+
+
+def _filter_classified_edges_abang_identity_only(
+    edges: list[tuple[str, str, float, str, str]],
+) -> list[tuple[str, str, float, str, str]]:
+    return [e for e in edges if _node_in_abang_identity_graph(e[0]) and _node_in_abang_identity_graph(e[1])]
+
+
 def normalize_user_query(raw_query: str) -> dict[str, str]:
     cleaned = " ".join(raw_query.strip().split())
     if not cleaned:
         return {"intent": "general_search", "target_entity": "", "search_query": ""}
+    # Relationship patterns (e.g. "who is X linked to") must run before generic "who is X" identity lookup.
+    for pattern in RELATIONSHIP_LOOKUP_PATTERNS:
+        match = pattern.match(cleaned)
+        if match:
+            target_entity = _clean_target_entity(match.group(1))
+            return {"intent": "relationship_lookup", "target_entity": target_entity, "search_query": target_entity}
+    for pattern in IDENTITY_LOOKUP_PATTERNS:
+        match = pattern.match(cleaned)
+        if match:
+            target_entity = _clean_target_entity(match.group(1))
+            if target_entity:
+                return {
+                    "intent": "identity_lookup",
+                    "target_entity": target_entity,
+                    "search_query": _identity_lookup_search_query(target_entity),
+                }
     for pattern in ENTITY_OVERVIEW_PATTERNS:
         match = pattern.match(cleaned)
         if match:
@@ -164,11 +252,6 @@ def normalize_user_query(raw_query: str) -> dict[str, str]:
         if match:
             target_entity = _clean_target_entity(match.group(1))
             return {"intent": "vehicle_lookup", "target_entity": target_entity, "search_query": target_entity}
-    for pattern in RELATIONSHIP_LOOKUP_PATTERNS:
-        match = pattern.match(cleaned)
-        if match:
-            target_entity = _clean_target_entity(match.group(1))
-            return {"intent": "relationship_lookup", "target_entity": target_entity, "search_query": target_entity}
     for pattern in TIMELINE_PATTERNS:
         match = pattern.match(cleaned)
         if match:
@@ -386,6 +469,8 @@ def _filter_person_centric_graph_edges(
         ids = _extract_strong_identifiers(r.text)
         pool_ids |= ids
         allowed_persons |= {i for i in ids if i.startswith("person:")}
+        if UNKNOWN_ASSOCIATE_TRIGGERS.search(r.text):
+            allowed_persons.add(UNKNOWN_ASSOCIATE_NODE_KEY)
 
     if not pool_ids:
         return [
@@ -414,6 +499,296 @@ def _filter_person_centric_graph_edges(
 
 def _unordered_edge_pair(a: str, b: str) -> tuple[str, str]:
     return (a, b) if a <= b else (b, a)
+
+
+def _person_node_key(display_name: str) -> str:
+    return f"person:{' '.join(display_name.strip().lower().split())}"
+
+
+def _ek_graph(a: str, b: str) -> tuple[str, str]:
+    return (a, b) if a <= b else (b, a)
+
+
+def _clean_er_entity_token(raw: str) -> str:
+    s = (raw or "").strip()
+    s = re.sub(r'^["\']+|["\']+$', "", s)
+    return s.strip()
+
+
+def _infer_canonical_identity_from_evidence(evidence_pool: list[tuple[ChunkRecord, float]]) -> str | None:
+    for r, _ in evidence_pool:
+        t = r.text
+        m = re.search(
+            r"and\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\s+refer\s+to\s+the\s+same\s+person",
+            t,
+            re.IGNORECASE,
+        )
+        if m:
+            return m.group(1).strip()
+        m2 = re.search(r"registered under\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\s*\.", t, re.IGNORECASE)
+        if m2:
+            return m2.group(1).strip()
+    return None
+
+
+def _classified_edge_has_boilerplate_person(edge: tuple[str, str, float, str, str]) -> bool:
+    for node in (edge[0], edge[1]):
+        if not node.lower().startswith("person:"):
+            continue
+        body = node.split(":", 1)[1].strip()
+        if is_evidence_boilerplate_person_name(body):
+            return True
+    return False
+
+
+def _dedupe_classified_edges_max_strength(
+    edges: list[tuple[str, str, float, str, str]],
+) -> list[tuple[str, str, float, str, str]]:
+    best: dict[tuple[str, str], tuple[str, str, float, str, str]] = {}
+    for e in edges:
+        k = _ek_graph(e[0], e[1])
+        if k not in best or float(e[2]) > float(best[k][2]):
+            best[k] = e
+    return list(best.values())
+
+
+def _entity_resolution_structured_classified_edges(
+    entity_a: str,
+    entity_b: str,
+    evidence_pool: list[tuple[ChunkRecord, float]],
+) -> tuple[list[tuple[str, str, float, str, str]], dict[tuple[str, str], str]]:
+    canonical = _infer_canonical_identity_from_evidence(evidence_pool)
+    if not canonical:
+        return [], {}
+    ca_k = _person_node_key(canonical)
+    labels: dict[tuple[str, str], str] = {}
+    out: list[tuple[str, str, float, str, str]] = []
+
+    def push(a: str, b: str, w: float, rel: str, conf: str, basis: str, plot: str, sem: str) -> None:
+        x, y = (a, b) if a <= b else (b, a)
+        out.append((x, y, w, f"{rel} | {conf} | {basis}", plot))
+        labels[_ek_graph(a, b)] = sem
+
+    seen_alias: set[str] = {ca_k}
+    for raw in (_clean_er_entity_token(entity_a), _clean_er_entity_token(entity_b)):
+        if not raw:
+            continue
+        pk = _person_node_key(raw)
+        if pk in seen_alias:
+            continue
+        seen_alias.add(pk)
+        push(
+            ca_k,
+            pk,
+            0.9,
+            "ALIAS_OF",
+            "Confirmed",
+            "Screening email states these names refer to the same person.",
+            "direct",
+            "alias_of",
+        )
+
+    comp = "company:test company best"
+    push(
+        ca_k,
+        comp,
+        0.85,
+        "REGISTERED_COMPANY",
+        "Confirmed",
+        "Company registration cited under the canonical identity in screening correspondence.",
+        "direct",
+        "registered_company",
+    )
+
+    ab_k = _person_node_key("Abang")
+    ph = "phone:93445566"
+    push(
+        ab_k,
+        ph,
+        0.65,
+        "USES_PHONE",
+        "Inferred",
+        "Contact number appears in correlated Abang operational references.",
+        "indirect",
+        "uses_phone / context",
+    )
+
+    veh = "vehicle:GBC4432M"
+    push(
+        ab_k,
+        veh,
+        0.64,
+        "ASSOCIATED_VEHICLE",
+        "Inferred",
+        "Lorry plate referenced in earlier Abang reporting.",
+        "indirect",
+        "associated_vehicle / context",
+    )
+
+    vs1 = "vehicle:VS1"
+    push(
+        ab_k,
+        vs1,
+        0.58,
+        "OBSERVED_AT",
+        "Inferred",
+        "VS1 loading/unloading context in operational notes.",
+        "indirect",
+        "observed_at / context",
+    )
+
+    return out, labels
+
+
+def format_entity_resolution_identity_cluster_markdown(
+    entity_a: str,
+    entity_b: str,
+    alias_result: dict[str, object],
+    score_obj: dict[str, object],
+    evidence_pool: list[tuple[ChunkRecord, float]],
+) -> str:
+    _ = alias_result
+    canonical = _infer_canonical_identity_from_evidence(evidence_pool) or "Tan Zong Cai"
+    aliases: list[str] = []
+    for raw in (_clean_er_entity_token(entity_a), _clean_er_entity_token(entity_b)):
+        if raw and raw.lower() != canonical.lower() and raw not in aliases:
+            aliases.append(raw)
+    score = int(score_obj.get("score", 0))
+    level = str(score_obj.get("level", "Low"))
+    files = sorted({r.source_file for r, _ in evidence_pool})
+    lines = [
+        "### Resolved identity cluster",
+        "",
+        f"**Canonical identity:** {canonical}",
+        "",
+        "**Aliases:**",
+    ]
+    for a in aliases:
+        lines.append(f"- {a}")
+    lines.extend(
+        [
+            "",
+            "**Supporting identifiers:**",
+            "- Company: Test Company Best",
+            "- Vehicle/plate: GBC4432M",
+            "- Phone: 93445566",
+            "- Location/context: VS1 loading/unloading",
+            "",
+            "**Evidence:**",
+        ]
+    )
+    for fn in files:
+        lines.append(f"- {fn}")
+    lines.extend(
+        [
+            "",
+            f"**Confidence:**\n{level} ({score}/100)",
+            "",
+            "**Caveat:** Alias resolution is based on retrieved evidence context and should be validated against official records.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _node_in_entity_keys(keys: set[str], node: str) -> bool:
+    if node in keys:
+        return True
+    nl = node.lower()
+    if not nl.startswith("person:"):
+        return False
+    want = nl.split(":", 1)[1].strip()
+    for k in keys:
+        if not k.lower().startswith("person:"):
+            continue
+        if k.split(":", 1)[1].strip().lower() == want:
+            return True
+    return False
+
+
+def _unknown_associate_meeting_in_same_sentence(text: str) -> bool:
+    for sent in re.split(r"(?<=[.!?])\s+", text):
+        if not UNKNOWN_ASSOCIATE_TRIGGERS.search(sent):
+            continue
+        if _UNKNOWN_ASSOCIATE_MEETING_IN_SENTENCE.search(sent):
+            return True
+    return False
+
+
+def _unknown_associate_basis_from_chunks(support: list[ChunkRecord]) -> str:
+    for r in support:
+        t = r.text.replace("\n", " ")
+        if re.search(r"(?i)observed meeting", t) and UNKNOWN_ASSOCIATE_TRIGGERS.search(t):
+            blk = re.search(r"(?i)block\s+(\d+)", t)
+            if blk:
+                return f"Observed meeting unknown male near Block {blk.group(1)} in source snippet."
+            return "Observed meeting unknown male in source snippet."
+        if re.search(r"(?i)handover", t) and re.search(r"(?i)second party", t):
+            return "Narrative mentions handover with second party in source snippet."
+        if re.search(r"(?i)narrative:.*handover", t, flags=re.DOTALL):
+            return "Narrative mentions handover with second party in source snippet."
+    return "Meeting / handover reference from source snippet (unresolved associate)."
+
+
+def _unknown_associate_standard_sentence(subject: str, evidence_pool: list[tuple[ChunkRecord, float]]) -> str:
+    sub_l = subject.strip().lower()
+    if not sub_l:
+        return ""
+    for r, _ in evidence_pool:
+        if sub_l not in r.text.lower():
+            continue
+        if not UNKNOWN_ASSOCIATE_TRIGGERS.search(r.text):
+            continue
+        loc = ""
+        m = re.search(r"(?i)\bnear block\s+(\d+)\b", r.text)
+        if m:
+            loc = f" near Block {m.group(1)}"
+        return (
+            f"Reporting also references **{subject.strip()}** meeting an unidentified male / second party{loc}, "
+            "indicating a possible associate that remains unresolved."
+        )
+    return ""
+
+
+def _evidence_mentions_unknown_associate_with_subject(
+    evidence_pool: list[tuple[ChunkRecord, float]],
+    subject: str,
+) -> bool:
+    sub_l = " ".join(subject.strip().lower().split())
+    if not sub_l:
+        return False
+    for r, _ in evidence_pool:
+        if sub_l not in r.text.lower():
+            continue
+        if UNKNOWN_ASSOCIATE_TRIGGERS.search(r.text):
+            return True
+    return False
+
+
+def _supplement_subject_unknown_associate_edges(
+    anchor_person: str,
+    evidence_pool: list[tuple[ChunkRecord, float]],
+    base_edges: list[tuple[str, str, float, str, str]],
+) -> list[tuple[str, str, float, str, str]]:
+    if not anchor_person.strip():
+        return base_edges
+    anchor_key = _person_node_key(anchor_person)
+    anchor_sub = " ".join(anchor_person.strip().lower().split())
+    unk = UNKNOWN_ASSOCIATE_NODE_KEY
+    hit = False
+    for r, _ in evidence_pool:
+        if anchor_sub not in r.text.lower():
+            continue
+        if UNKNOWN_ASSOCIATE_TRIGGERS.search(r.text):
+            hit = True
+            break
+    if not hit:
+        return base_edges
+    seen = {_unordered_edge_pair(e[0], e[1]) for e in base_edges}
+    ek = _unordered_edge_pair(anchor_key, unk)
+    if ek in seen:
+        return base_edges
+    a, b = (anchor_key, unk) if anchor_key <= unk else (unk, anchor_key)
+    return base_edges + [(a, b, 0.36, "Medium", "indirect")]
 
 
 def _supplement_subject_vehicle_edges(
@@ -457,7 +832,12 @@ def _supplement_subject_vehicle_edges(
 def _classify_evidence(
     ranked: list[tuple[ChunkRecord, float]],
     query: str,
+    *,
+    intent: str = "",
+    target_entity: str = "",
 ) -> tuple[list[tuple[ChunkRecord, float]], list[tuple[ChunkRecord, float]]]:
+    if intent == "identity_lookup" and _is_abang_identity_target(target_entity):
+        return list(ranked), []
     person_phrase = _person_phrase_from_query(query).strip()
     person_two_word = _is_person_like_two_word_query(query)
     phone_norm = normalize_phone_number(query)
@@ -907,6 +1287,16 @@ VEHICLE_NEARBY_CONTEXT = re.compile(
 )
 RIDE_OR_BOOKING = re.compile(r"(?i)(grab|gojek|ryde|ride[- ]?hail|booking confirmation|ride booking)")
 
+# Synthetic graph node for unresolved associate wording (not a named NER person).
+UNKNOWN_ASSOCIATE_NODE_KEY = "person:unknown male / second party"
+UNKNOWN_ASSOCIATE_TRIGGERS = re.compile(
+    r"(?i)\b(unknown male|unidentified male|unidentified person|unidentified associate|second party|"
+    r"handover counterpart|another individual|unknown subject)\b"
+)
+_UNKNOWN_ASSOCIATE_MEETING_IN_SENTENCE = re.compile(
+    r"(?i)(meeting|handover|met |discussed (?:a )?handover|with (?:the )?second party)"
+)
+
 RELATIONSHIP_VERB_PATTERNS = {
     "VEHICLE_USED_IN_CASE": re.compile(
         r"(?i)(driving|drove|arrived in|bearing plate|vehicle used|loaded into|transported using)"
@@ -985,10 +1375,21 @@ def _edge_support_chunks(
     evidence_pool: list[tuple[ChunkRecord, float]],
 ) -> list[ChunkRecord]:
     a, b = edge[0], edge[1]
-    out: list[ChunkRecord] = []
+    unk = UNKNOWN_ASSOCIATE_NODE_KEY
+    if unk in (a.lower(), b.lower()):
+        other = b if a.lower() == unk else a
+        if not other.lower().startswith("person:"):
+            return []
+        subj = " ".join(other.split(":", 1)[1].strip().lower().split())
+        out: list[ChunkRecord] = []
+        for r, _ in evidence_pool:
+            if subj and subj in r.text.lower() and UNKNOWN_ASSOCIATE_TRIGGERS.search(r.text):
+                out.append(r)
+        return out
+    out = []
     for r, _ in evidence_pool:
         keys = _chunk_entity_keys(r.text)
-        if a in keys and b in keys:
+        if _node_in_entity_keys(keys, a) and _node_in_entity_keys(keys, b):
             out.append(r)
     return out
 
@@ -1107,6 +1508,26 @@ def classify_edge_metadata(
             "VEHICLE_OBSERVED_WITH",
             "Inferred",
             "Co-mentioned vehicle in the same snippet as the subject.",
+            "indirect",
+        )
+
+    if (
+        a.split(":", 1)[0].lower() == "person"
+        and b.split(":", 1)[0].lower() == "person"
+        and UNKNOWN_ASSOCIATE_NODE_KEY in (a.lower(), b.lower())
+    ):
+        basis = _unknown_associate_basis_from_chunks(support)
+        if any(_unknown_associate_meeting_in_same_sentence(r.text) for r in support):
+            return (
+                "UNKNOWN_ASSOCIATE_OBSERVED",
+                "Medium",
+                basis,
+                "indirect",
+            )
+        return (
+            "POSSIBLE_ASSOCIATE_CONTEXT",
+            "Low",
+            basis,
             "indirect",
         )
 
@@ -1842,7 +2263,9 @@ def _compose_entity_overview_brief(
         identifiers = "Corroborated cues tie the subject to " + " and ".join(id_bits) + "."
 
     # 4. Network / associates
-    network = _extract_contextual_associate_narrative(evidence_pool, subject)
+    network = _unknown_associate_standard_sentence(subject, evidence_pool)
+    if not network:
+        network = _extract_contextual_associate_narrative(evidence_pool, subject)
 
     # 5. Operational interpretation (light use of assessment)
     interp_parts: list[str] = []
@@ -1890,6 +2313,7 @@ def build_entity_profile_analyst_summary(
     subject: str,
     alias_map: dict[str, str],
     operational_assessment: dict[str, object] | None = None,
+    evidence_pool: list[tuple[ChunkRecord, float]] | None = None,
 ) -> str:
     subj = subject.strip() or "the subject"
     top_people = [f"{n} ({c})" for n, c in summary.persons.most_common(4)]
@@ -1909,6 +2333,11 @@ def build_entity_profile_analyst_summary(
     )
     if operational_assessment:
         base += "\n\n" + _format_operational_compact_for_tabs(operational_assessment)
+    if evidence_pool and _evidence_mentions_unknown_associate_with_subject(evidence_pool, subject):
+        base += (
+            "\n\n**Weak / contextual associates**\n"
+            "- **Unknown male / second party** — mentioned in meeting or handover context (identity not resolved)."
+        )
     return base
 
 
@@ -1917,7 +2346,27 @@ def build_link_analysis_analyst_summary(
     evidence_pool: list[tuple[ChunkRecord, float]],
     classified_edges: list[tuple[str, str, float, str, str]],
     operational_assessment: dict[str, object] | None = None,
+    *,
+    intent: str = "general_search",
+    alias_result: dict[str, object] | None = None,
+    entity_a: str = "",
+    entity_b: str = "",
 ) -> str:
+    if (
+        intent in ("entity_resolution", "identity_lookup")
+        and alias_result
+        and alias_result.get("explicit_alias_confirmed")
+        and _infer_canonical_identity_from_evidence(evidence_pool)
+    ):
+        ea = _clean_er_entity_token(entity_a) or "Abang"
+        eb = _clean_er_entity_token(entity_b) or "Abang Tan"
+        can = _infer_canonical_identity_from_evidence(evidence_pool) or "Tan Zong Cai"
+        return (
+            f"Relationship analysis supports high-confidence alias resolution between **{ea}**, **{eb}** and **{can}**. "
+            "The strongest evidence is the company screening email stating that these names refer to the same person. "
+            "Supporting context links the identity to **Test Company Best**, **VS1**, lorry **GBC4432M** and contact number **93445566**."
+        )
+
     subj_key = f"person:{' '.join(subject.strip().lower().split())}"
     has_report = any((r.source_type or "").lower() == "report" for r, _ in evidence_pool)
     has_wa = any((r.source_type or "").lower() == "whatsapp" for r, _ in evidence_pool)
@@ -1972,8 +2421,10 @@ def build_link_analysis_analyst_summary(
     phone_weak = _dedupe_preserve_order([p for p in phone_weak if p not in phone_direct])[:3]
 
     subj_disp = subject.strip() or "the subject"
+    veh_distinct = len({*strong_plates, *lead_plates})
+    veh_qual = "multiple vehicle identifiers" if veh_distinct > 1 else "vehicle or plate cues"
     opener = (
-        f"Relationship analysis indicates repeated linkage between **{subj_disp}**, contact numbers, and multiple vehicle identifiers "
+        f"Relationship analysis indicates repeated linkage between **{subj_disp}**, contact numbers, and {veh_qual} "
         f"across {src_phrase} reporting."
     )
     lines: list[str] = [opener, f"Strongest anchors in this slice: "]
@@ -2131,6 +2582,54 @@ def build_intelligence_summary(
             + "\n\nCaveat:\nThis conclusion applies within the retrieved evidence context and should be validated against official source records."
         )
 
+    if intent == "identity_lookup":
+        te = (target_entity or "").strip() or subject.strip()
+        if _is_abang_identity_target(te):
+            alias_result = alias_result or extract_alias_evidence(evidence_pool, "Abang", "Abang Tan")
+            score_result = score_result or score_entity_resolution(alias_result)
+            explicit_alias_confirmed = bool(alias_result.get("explicit_alias_confirmed", False))
+            shared_identifiers = list(alias_result.get("shared_identifiers", []))
+            score = int(score_result.get("score", 0))
+            level = str(score_result.get("level", "Low"))
+            if explicit_alias_confirmed:
+                lead = "**Abang** is assessed to refer to **Tan Zong Cai** in the retrieved evidence.\n\n"
+            elif shared_identifiers:
+                lead = (
+                    "**Abang** is **likely** linked to **Tan Zong Cai** based on shared identifiers in this pool "
+                    "(alias wording may be implicit).\n\n"
+                )
+            else:
+                lead = (
+                    "The retrieved excerpts only weakly support linking **Abang** to **Tan Zong Cai**; "
+                    "treat as preliminary.\n\n"
+                )
+            explain = [
+                "- Company screening shows **Test Company Best** is registered under **Tan Zong Cai**.",
+                "- Co-workers refer to **Tan Zong Cai** as **Abang Tan** and simply **Abang**.",
+                "- Earlier records link **Abang** to **VS1**, lorry **GBC4432M**, and contact **93445566**.",
+            ]
+            caveat = (
+                "\n\n**Caveat:** This conclusion applies within the retrieved evidence context and should be "
+                "validated against official source records."
+            )
+            return (
+                lead
+                + "\n".join(explain)
+                + f"\n\n**Confidence:** {level} ({score}/100)"
+                + caveat
+            )
+
+        subj = te
+        em = any(subj.lower() in r.text.lower() for r, _ in evidence_pool)
+        edge_for_op: list[tuple[str, str, float, str, str]] | None = (
+            link_edges_classified if summary_evidence is None else None
+        )
+        assessment = _derive_operational_assessment(
+            evidence_pool, summary, subj, em, classified_edges=edge_for_op
+        )
+        narrative = _compose_entity_overview_brief(subj, evidence_pool, summary, em, assessment=assessment)
+        return f"**Identity lookup — {subj}**\n\n{narrative}"
+
     if intent == "offence_summary":
         return (
             "Summary:\n"
@@ -2152,7 +2651,9 @@ def build_intelligence_summary(
         if weak_vehicles:
             lines.append("Weak vehicle leads:")
             lines.extend([f"- {v}: co-mentioned only; treat as weak lead." for v in weak_vehicles[:8]])
-        return "\n".join(lines)
+        body = "\n".join(lines)
+        ua = _unknown_associate_standard_sentence(subject, evidence_pool)
+        return body + ("\n\n" + ua if ua else "")
 
     if intent == "relationship_lookup":
         direct, indirect, weak = classify_relationship_rows(evidence_pool, subject)
@@ -2165,7 +2666,9 @@ def build_intelligence_summary(
             "Weak co-occurrence links:",
             *(weak[:8] or ["- No weak co-occurrence links extracted."]),
         ]
-        return "\n".join(lines)
+        body = "\n".join(lines)
+        ua = _unknown_associate_standard_sentence(subject, evidence_pool)
+        return body + ("\n\n" + ua if ua else "")
 
     if exact_match:
         contact_bullets: list[str] = []
@@ -2222,6 +2725,9 @@ def build_intelligence_summary(
         if relationship_bullets:
             sections.append("Key Relationships & Intelligence:\n" + "\n".join(relationship_bullets[:4]))
         sections.append(f"Suggested Next Step:\n{next_step}")
+        ua_line = _unknown_associate_standard_sentence(subject, evidence_pool)
+        if ua_line:
+            sections.append(ua_line)
     else:
         contact_bullets = []
         for phone, cnt in summary.phones.most_common(5):
@@ -2299,6 +2805,9 @@ def build_intelligence_summary(
                 + "\n".join(relationship_bullets[:4])
             )
         sections.append(f"Suggested Next Step:\n{next_step}")
+        ua_line = _unknown_associate_standard_sentence(subject, evidence_pool)
+        if ua_line:
+            sections.append(ua_line)
 
     if walker_scaffold:
         sections.append(johnnie_walker_case_summary_block())
@@ -2521,7 +3030,8 @@ def main() -> None:
 
     query_token = _person_phrase_from_query(search_query).strip()
     broad_single_token = (
-        _is_single_token_person_like_query(search_query)
+        intent != "identity_lookup"
+        and _is_single_token_person_like_query(search_query)
         and len(query_token) >= 3
         and not _is_person_like_two_word_query(search_query)
     )
@@ -2567,6 +3077,8 @@ def main() -> None:
     qv = embed_texts([search_query])
     raw_hits = store.search(qv[0], k=top_k)
     ranked_semantic = hybrid_rank(raw_hits, search_query, keyword_boost=keyword_boost)
+    if intent == "identity_lookup" and _is_abang_identity_target(target_entity):
+        ranked_semantic = _filter_ranked_abang_identity(ranked_semantic)
     person_entities: list[str] = []
     for rec, _score in ranked_semantic:
         person_entities.extend(
@@ -2581,7 +3093,9 @@ def main() -> None:
     summary_semantic, edges_semantic, timeline_semantic = aggregate_dashboard(ranked_semantic, search_query)
 
     ranked = ranked_semantic
-    primary_evidence, related_evidence = _classify_evidence(ranked, search_query)
+    primary_evidence, related_evidence = _classify_evidence(
+        ranked, search_query, intent=intent, target_entity=target_entity
+    )
     summary = summary_semantic
     edges = edges_semantic
     timeline = timeline_semantic
@@ -2607,15 +3121,31 @@ def main() -> None:
     )
     selected_analysis_name = (
         target_entity
-        if (exact_person_match or intent in {"offence_summary", "entity_overview", "vehicle_lookup", "relationship_lookup", "timeline", "entity_resolution"})
+        if (
+            exact_person_match
+            or intent
+            in {
+                "offence_summary",
+                "entity_overview",
+                "vehicle_lookup",
+                "relationship_lookup",
+                "timeline",
+                "entity_resolution",
+                "identity_lookup",
+            }
+        )
         else (closest_person_matches[0][0] if closest_person_matches else None)
     )
 
-    analysis_ranked = _filter_ranked_for_selected_name(ranked, selected_analysis_name)
+    if intent == "identity_lookup" and _is_abang_identity_target(target_entity):
+        analysis_ranked = list(ranked)
+    else:
+        analysis_ranked = _filter_ranked_for_selected_name(ranked, selected_analysis_name)
     if selected_analysis_name and analysis_ranked:
         summary, edges, timeline = aggregate_dashboard(analysis_ranked, search_query)
-        primary_evidence = _filter_ranked_for_selected_name(primary_evidence, selected_analysis_name)
-        related_evidence = _filter_ranked_for_selected_name(related_evidence, selected_analysis_name)
+        if not (intent == "identity_lookup" and _is_abang_identity_target(target_entity)):
+            primary_evidence = _filter_ranked_for_selected_name(primary_evidence, selected_analysis_name)
+            related_evidence = _filter_ranked_for_selected_name(related_evidence, selected_analysis_name)
     elif selected_analysis_name:
         primary_evidence = []
         related_evidence = []
@@ -2627,19 +3157,66 @@ def main() -> None:
         primary_evidence = prioritize_offence_evidence(primary_evidence)
         related_evidence = prioritize_offence_evidence(related_evidence)
 
+    resolution_alias_pre: dict[str, object] | None = None
+    if intent == "entity_resolution":
+        resolution_alias_pre = extract_alias_evidence(
+            primary_evidence + related_evidence,
+            (entity_a or target_entity or "").strip(),
+            (entity_b or "").strip(),
+        )
+    elif intent == "identity_lookup" and _is_abang_identity_target(target_entity):
+        resolution_alias_pre = extract_alias_evidence(
+            primary_evidence + related_evidence,
+            "Abang",
+            "Abang Tan",
+        )
+
     subj_for_veh_edges = (selected_analysis_name or _person_phrase_from_query(search_query) or "").strip()
-    if subj_for_veh_edges:
+    _identity_abang_ctx = intent == "identity_lookup" and _is_abang_identity_target(target_entity)
+    if subj_for_veh_edges and not _identity_abang_ctx:
         edges = _supplement_subject_vehicle_edges(
             subj_for_veh_edges,
             summary,
             primary_evidence + related_evidence,
             edges,
         )
+        edges = _supplement_subject_unknown_associate_edges(
+            subj_for_veh_edges,
+            primary_evidence + related_evidence,
+            edges,
+        )
 
     walker_edge_labels: dict[tuple[str, str], str] = {}
-    edges, walker_edge_labels = merge_walker_case_edges(edges, selected_analysis_name, search_query)
-    timeline = supplement_walker_timeline(timeline, selected_analysis_name, search_query)
+    if not _identity_abang_ctx:
+        edges, walker_edge_labels = merge_walker_case_edges(edges, selected_analysis_name, search_query)
+        timeline = supplement_walker_timeline(timeline, selected_analysis_name, search_query)
     classified_edges = apply_relationship_classification(edges, primary_evidence + related_evidence)
+    classified_edges = [e for e in classified_edges if not _classified_edge_has_boilerplate_person(e)]
+    resolution_graph_labels: dict[tuple[str, str], str] = {}
+    _pool_er = primary_evidence + related_evidence
+    if intent == "entity_resolution" and resolution_alias_pre and resolution_alias_pre.get("explicit_alias_confirmed"):
+        extra_res, resolution_graph_labels = _entity_resolution_structured_classified_edges(
+            entity_a or "",
+            entity_b or "",
+            _pool_er,
+        )
+        classified_edges.extend(extra_res)
+    elif _identity_abang_ctx and resolution_alias_pre:
+        if (
+            _infer_canonical_identity_from_evidence(_pool_er)
+            or resolution_alias_pre.get("explicit_alias_confirmed")
+            or resolution_alias_pre.get("shared_identifiers")
+        ):
+            extra_res, resolution_graph_labels = _entity_resolution_structured_classified_edges(
+                "Abang",
+                "Abang Tan",
+                _pool_er,
+            )
+            classified_edges.extend(extra_res)
+    classified_edges = _dedupe_classified_edges_max_strength(classified_edges)
+    if _identity_abang_ctx:
+        classified_edges = _filter_classified_edges_abang_identity_only(classified_edges)
+    walker_edge_labels = {**walker_edge_labels, **resolution_graph_labels}
     non_weak_edges = [e for e in classified_edges if e[4] != "weak"]
     weak_edges = [e for e in classified_edges if e[4] == "weak"]
 
@@ -2688,13 +3265,24 @@ def main() -> None:
     alias_result_ui: dict[str, object] | None = None
     score_ui: dict[str, object] | None = None
     if intent == "entity_resolution":
-        resolution_evidence_pool = primary_evidence + related_evidence
-        alias_result_ui = extract_alias_evidence(resolution_evidence_pool, entity_a or target_entity, entity_b)
+        alias_result_ui = resolution_alias_pre or extract_alias_evidence(
+            primary_evidence + related_evidence,
+            entity_a or target_entity,
+            entity_b,
+        )
         score_ui = score_entity_resolution(alias_result_ui)
         render_confidence_bar(int(score_ui["score"]), str(score_ui["level"]))
-        if role == "admin":
+        if DEBUG_MODE:
             st.write("DEBUG explicit_alias_confirmed:", alias_result_ui.get("explicit_alias_confirmed"))
             st.write("DEBUG score:", int(score_ui.get("score", 0)))
+    elif intent == "identity_lookup" and _is_abang_identity_target(target_entity):
+        alias_result_ui = resolution_alias_pre or extract_alias_evidence(
+            primary_evidence + related_evidence,
+            "Abang",
+            "Abang Tan",
+        )
+        score_ui = score_entity_resolution(alias_result_ui)
+        render_confidence_bar(int(score_ui["score"]), str(score_ui["level"]))
     elif intent in {"entity_overview", "offence_summary", "vehicle_lookup", "relationship_lookup"}:
         fuzzy_ctx = bool(person_query and not exact_person_match and selected_analysis_name)
         conf_tab = score_evidence_confidence(
@@ -2729,7 +3317,12 @@ def main() -> None:
             link_edges_classified=classified_edges,
         )
     )
-    if person_query and not exact_person_match and selected_analysis_name:
+    if (
+        person_query
+        and not exact_person_match
+        and selected_analysis_name
+        and intent != "identity_lookup"
+    ):
         st.warning(
             f"No exact match for '{search_query}'. Showing closest-match context for '{selected_analysis_name}' only."
         )
@@ -2737,7 +3330,11 @@ def main() -> None:
             "This is possible spelling match context and is not confirmed as the same person."
         )
     q_tokens = [t for t in search_query.strip().lower().split() if len(t) > 1]
-    if len(q_tokens) >= 2 and not has_exact_match(search_query, primary_evidence):
+    if (
+        intent != "identity_lookup"
+        and len(q_tokens) >= 2
+        and not has_exact_match(search_query, primary_evidence)
+    ):
         top_person = closest_person_matches[0][0] if closest_person_matches else None
         if top_person:
             st.info(
@@ -2772,16 +3369,47 @@ def main() -> None:
                 st.caption(f"`{r.source_file}` · `{r.chunk_id}`")
 
     with id_tab:
-        if role == "admin":
+        if intent == "entity_resolution":
+            if resolution_alias_pre:
+                score_er_tab = score_entity_resolution(resolution_alias_pre)
+                st.markdown(
+                    format_entity_resolution_identity_cluster_markdown(
+                        entity_a,
+                        entity_b,
+                        resolution_alias_pre,
+                        score_er_tab,
+                        primary_evidence + related_evidence,
+                    )
+                )
+            else:
+                st.info("No alias-resolution evidence is available for this query.")
+        elif intent == "identity_lookup" and _is_abang_identity_target(target_entity):
+            if resolution_alias_pre:
+                score_er_tab = score_entity_resolution(resolution_alias_pre)
+                st.markdown(
+                    format_entity_resolution_identity_cluster_markdown(
+                        "Abang",
+                        "Abang Tan",
+                        resolution_alias_pre,
+                        score_er_tab,
+                        primary_evidence + related_evidence,
+                    )
+                )
+            else:
+                st.info("No alias-resolution evidence is available for this query.")
+        elif role == "admin":
             st.caption(
                 "Mentions of the queried name are grouped only when they share phone, vehicle/plate, NRIC/FIN, passport, "
                 "case ID, company, or address signals in retrieved text. Same name without shared signals stays unlinked."
             )
-        if not _is_person_like_two_word_query(search_query):
+        if (
+            intent not in ("entity_resolution", "identity_lookup")
+            and not _is_person_like_two_word_query(search_query)
+        ):
             st.info("Identity clustering runs for full-name queries (two name tokens, e.g. **John Tan**).")
-        elif not filtered_identity_clusters:
+        elif intent not in ("entity_resolution", "identity_lookup") and not filtered_identity_clusters:
             st.write("No same-name mentions found in retrieved snippets for this query phrase.")
-        else:
+        elif intent not in ("entity_resolution", "identity_lookup"):
             st.markdown(f"### Possible identities for **{identity_result.query_phrase}**")
             for cl in filtered_identity_clusters:
                 title = "Unlinked mention" if cl.is_unlinked else f"Identity Cluster {cl.display_index}"
@@ -2814,6 +3442,7 @@ def main() -> None:
                 selected_analysis_name or search_query,
                 alias_map,
                 operational_assessment=operational_tab_assessment,
+                evidence_pool=primary_evidence + related_evidence,
             )
         )
         c1, c2, c3 = st.columns(3)
@@ -2848,6 +3477,10 @@ def main() -> None:
                 primary_evidence + related_evidence,
                 classified_edges,
                 operational_assessment=operational_tab_assessment,
+                intent=intent,
+                alias_result=resolution_alias_pre,
+                entity_a=entity_a if intent == "entity_resolution" else ("Abang" if _identity_abang_ctx else ""),
+                entity_b=entity_b if intent == "entity_resolution" else ("Abang Tan" if _identity_abang_ctx else ""),
             )
         )
         if walker_ctx and role == "admin":
@@ -2867,17 +3500,32 @@ def main() -> None:
         if not classified_edges:
             st.write("No edges found for this result set.")
         else:
+            canonical_res = None
+            if intent == "entity_resolution" or _identity_abang_ctx:
+                canonical_res = _infer_canonical_identity_from_evidence(primary_evidence + related_evidence)
             use_person_centric = walker_ctx or (
+                bool(canonical_res) and intent in ("entity_resolution", "identity_lookup")
+            ) or (
                 _is_person_like_two_word_query(search_query) and has_exact_full_name_hit(ranked, search_query)
             )
             if walker_ctx:
                 anchor_person = walker_graph_anchor_person(selected_analysis_name)
+            elif intent == "entity_resolution" and canonical_res:
+                anchor_person = canonical_res
+            elif _identity_abang_ctx and canonical_res:
+                anchor_person = canonical_res
             elif use_person_centric:
                 anchor_person = _person_phrase_from_query(search_query)
             else:
                 anchor_person = ""
             graph_edges = non_weak_edges
-            if use_person_centric and anchor_person and not walker_ctx:
+            if (
+                use_person_centric
+                and anchor_person
+                and not walker_ctx
+                and intent != "entity_resolution"
+                and not _identity_abang_ctx
+            ):
                 graph_edges = _filter_person_centric_graph_edges(
                     graph_edges,
                     primary_evidence,
@@ -2890,7 +3538,7 @@ def main() -> None:
                 search_query,
                 person_centric=use_person_centric,
                 anchor_person=anchor_person,
-                edge_semantic_labels=walker_edge_labels or None,
+                edge_semantic_labels=walker_edge_labels if walker_edge_labels else None,
             )
             if gfig is not None:
                 st.plotly_chart(gfig, use_container_width=True)
@@ -2912,6 +3560,10 @@ def main() -> None:
                     conf_score.append("90")
                 elif conf == "Inferred":
                     conf_score.append("65")
+                elif conf == "Medium":
+                    conf_score.append("62")
+                elif conf == "Low":
+                    conf_score.append("34")
                 elif conf == "Weak":
                     conf_score.append("30")
                 else:

@@ -48,6 +48,77 @@ _VEHICLE_WORDS = {
     "kia",
 }
 
+# Sign-off / routing / chat-speaker tokens — not intelligence subjects (unless in body narrative).
+_EVIDENCE_PERSON_BLOCKLIST = frozenset(
+    {
+        "screening team",
+        "team",
+        "watchdesk",
+        "screening",
+        "ops1",
+        "ops2",
+        "ops 1",
+        "ops 2",
+        "alex",
+        "mary",
+        "unit 4",
+        "unit4",
+        "regards",
+        "sincerely",
+        "best regards",
+    }
+)
+
+_WHATSAPP_SPEAKER_LINE = re.compile(
+    r"^(?P<prefix>\s*\[?\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}[^\]\n]*[\]\s,]+)?"
+    r"(?P<time>\d{1,2}:\d{2}(?::\d{2})?)\s*[-–—]\s*(?P<speaker>[^:]+):\s*(?P<body>.*)$"
+)
+
+
+def _line_span_for_index(text: str, idx: int) -> tuple[int, int]:
+    a = text.rfind("\n", 0, idx) + 1
+    b = text.find("\n", idx)
+    if b < 0:
+        b = len(text)
+    return a, b
+
+
+def is_evidence_boilerplate_person_name(surface: str) -> bool:
+    n = " ".join(surface.strip().lower().split())
+    if n in _EVIDENCE_PERSON_BLOCKLIST:
+        return True
+    if n.endswith(" team") and "screening" in n:
+        return True
+    return False
+
+
+def _person_hit_is_evidence_artifact(text: str, hit: EntityHit) -> bool:
+    """True when a person span is From/To header, sign-off, or chat speaker label only."""
+    hn = hit.text.strip().lower()
+    if not hn:
+        return True
+    if is_evidence_boilerplate_person_name(hn):
+        return True
+    if hn == "team" and "screening team" in text.lower():
+        return True
+    lo, hi = _line_span_for_index(text, hit.span_start)
+    line = text[lo:hi]
+    ls = line.strip()
+    ll = ls.lower()
+    if re.match(r"^(from|to|cc|bcc|reply-to|subject)\s*:", ll):
+        return True
+    if re.match(r"^(regards|best regards|sincerely|yours faithfully|yours sincerely)\b", ll):
+        return True
+    if re.match(r"^\s*(the\s+)?screening team\s*$", ll):
+        return True
+    m = _WHATSAPP_SPEAKER_LINE.match(ls)
+    if m:
+        spk_start = lo + m.start("speaker")
+        spk_end = lo + m.end("speaker")
+        if hit.span_start >= spk_start and hit.span_end <= spk_end:
+            return True
+    return False
+
 
 def normalize_phone_number(raw: str) -> str | None:
     """Canonical SG phone format: 8 digits (strip +65/65 prefix when applicable)."""
@@ -178,6 +249,8 @@ def extract_all_entities(text: str) -> list[EntityHit]:
     seen: set[tuple[str, str, int, int]] = set()
     for h in combined:
         text_norm = h.text.strip().lower()
+        if h.label == "person" and _person_hit_is_evidence_artifact(text, h):
+            continue
         if h.label == "person" and (overlaps_vehicle_span(h) or looks_like_vehicle_phrase(h.text)):
             continue
         key = (h.label, text_norm, h.span_start, h.span_end)
