@@ -140,14 +140,13 @@ def load_report(path: Path) -> LoadedDocument:
         text = "\n\n".join(p.text.strip() for p in doc.paragraphs if p.text.strip())
     else:
         text = _decode_bytes_prefer(path.read_bytes())
-    mtime = datetime.fromtimestamp(path.stat().st_mtime)
     return LoadedDocument(
         doc_id=f"report:{path.name}",
         source_type="report",
         title=path.name,
         source_file=path.name,
         text=text,
-        occurred_at=mtime,
+        occurred_at=None,
     )
 
 

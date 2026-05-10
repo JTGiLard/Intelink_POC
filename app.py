@@ -4,6 +4,7 @@ import os
 import re
 import shutil
 from collections import Counter, defaultdict
+from datetime import datetime
 from difflib import SequenceMatcher
 from pathlib import Path
 
@@ -375,17 +376,18 @@ def _filter_person_centric_graph_edges(
     if not edges or not anchor_person.strip():
         return edges
     anchor_key = f"person:{' '.join(anchor_person.strip().lower().split())}"
+    anchor_sub = " ".join(anchor_person.strip().lower().split())
 
-    primary_ids: set[str] = set()
+    pool_ids: set[str] = set()
     allowed_persons: set[str] = {anchor_key}
-    for r, _ in primary_evidence:
+    for r, _ in primary_evidence + linked_evidence:
+        if anchor_sub not in r.text.lower():
+            continue
         ids = _extract_strong_identifiers(r.text)
-        primary_ids |= {i for i in ids if not i.startswith("person:")}
+        pool_ids |= ids
         allowed_persons |= {i for i in ids if i.startswith("person:")}
 
-    if not primary_ids:
-        # If no strong identifiers are available, remain conservative and keep only
-        # edges touching person mentions that occurred in exact primary evidence.
+    if not pool_ids:
         return [
             e
             for e in edges
@@ -395,26 +397,61 @@ def _filter_person_centric_graph_edges(
             )
         ]
 
-    for r, _ in linked_evidence:
-        ids = _extract_strong_identifiers(r.text)
-        if primary_ids & ids:
-            allowed_persons |= {i for i in ids if i.startswith("person:")}
-
-    allowed_nodes: set[str] = set(primary_ids) | allowed_persons
+    allowed_nodes: set[str] = set(pool_ids) | allowed_persons
 
     def node_ok(node: str) -> bool:
         nl = node.lower()
         if nl.startswith("person:"):
             return nl in allowed_persons
-        # Keep key identifier node types only when validated against primary IDs.
         if nl.startswith(("phone:", "vehicle:", "nric:", "case:", "company:")):
             return nl in allowed_nodes
         return True
 
     filtered = [e for e in edges if node_ok(e[0]) and node_ok(e[1])]
-    # Ensure anchor remains central if present.
     anchor_edges = [e for e in filtered if e[0].lower() == anchor_key or e[1].lower() == anchor_key]
     return anchor_edges + [e for e in filtered if e not in anchor_edges]
+
+
+def _unordered_edge_pair(a: str, b: str) -> tuple[str, str]:
+    return (a, b) if a <= b else (b, a)
+
+
+def _supplement_subject_vehicle_edges(
+    anchor_person: str,
+    summary: EntitySummary,
+    evidence_pool: list[tuple[ChunkRecord, float]],
+    base_edges: list[tuple[str, str, float, str, str]],
+) -> list[tuple[str, str, float, str, str]]:
+    """Ensure corroborated vehicle mentions (>=2) co-tagged with the subject appear as graph edges."""
+    if not anchor_person.strip():
+        return base_edges
+    anchor_key = f"person:{' '.join(anchor_person.strip().lower().split())}"
+    anchor_sub = " ".join(anchor_person.strip().lower().split())
+    seen = {_unordered_edge_pair(e[0], e[1]) for e in base_edges}
+    out = list(base_edges)
+    mention_counts: Counter[str] = Counter()
+    for r, _ in evidence_pool:
+        if anchor_sub not in r.text.lower():
+            continue
+        for h in extract_all_entities(r.text):
+            if h.label != "vehicle":
+                continue
+            raw = h.text.strip()
+            if not raw:
+                continue
+            mention_counts[raw] += 1
+
+    for veh, cnt in mention_counts.items():
+        if cnt < 2 and summary.vehicles.get(veh, 0) < 2:
+            continue
+        vk = f"vehicle:{veh}"
+        ek = _unordered_edge_pair(anchor_key, vk)
+        if ek in seen:
+            continue
+        seen.add(ek)
+        a, b = (anchor_key, vk) if anchor_key <= vk else (vk, anchor_key)
+        out.append((a, b, 0.42, "Medium", "direct"))
+    return out
 
 
 def _classify_evidence(
@@ -1022,26 +1059,49 @@ def classify_edge_metadata(
     if kinds == {"person", "vehicle"}:
         strong = False
         nearby = False
+        report_mention = False
+        phone_bridge = False
         for r in support:
             t = r.text
+            st = (r.source_type or "").lower()
+            if st == "report":
+                report_mention = True
             if VEHICLE_SUBJECT_STRONG.search(t):
                 strong = True
-                break
             if VEHICLE_NEARBY_CONTEXT.search(t):
                 nearby = True
+            hits = extract_all_entities(t)
+            has_phone = any(h.label == "phone" for h in hits)
+            has_veh = any(h.label == "vehicle" for h in hits)
+            if has_phone and has_veh:
+                phone_bridge = True
         if strong:
             return (
-                "VEHICLE_SUBJECT_USE",
+                "VEHICLE_OBSERVED_WITH",
                 "Confirmed",
-                "Field or chat wording ties the subject to the plate (arrival, bearing plate, or driving).",
+                "Field or chat wording ties the subject to the vehicle (arrival, bearing plate, or driving).",
                 "direct",
+            )
+        if phone_bridge:
+            return (
+                "VEHICLE_ASSOCIATED_VIA_PHONE",
+                "Inferred",
+                "Vehicle and contact detail co-occur with the subject in the same operational snippet.",
+                "indirect",
+            )
+        if report_mention:
+            return (
+                "VEHICLE_MENTIONED_IN_REPORT",
+                "Inferred",
+                "Vehicle or plate appears in formal reporting alongside the subject.",
+                "indirect",
             )
         if nearby:
             return (
-                "VEHICLE_CONTEXTUAL",
-                "Inferred",
-                "Vehicle appears as nearby or observational context; treat as a lead, not confirmed use.",
-                "indirect",
+                "POSSIBLE_VEHICLE_MATCH",
+                "Weak",
+                "Observational or nearby-vehicle context only; corroborate before treating as the same physical vehicle.",
+                "weak",
             )
         return (
             "VEHICLE_OBSERVED_WITH",
@@ -1155,6 +1215,101 @@ def score_entity_resolution(alias_result: dict[str, object]) -> dict[str, object
 def render_confidence_bar(score: int, level: str) -> None:
     st.progress(max(0.0, min(1.0, float(score) / 100.0)))
     st.caption(f"Confidence: {level} ({score}/100)")
+
+
+def score_evidence_confidence(
+    *,
+    search_query: str,
+    selected_analysis_name: str | None,
+    exact_match: bool,
+    evidence_pool: list[tuple[ChunkRecord, float]],
+    summary: EntitySummary,
+    classified_edges: list[tuple[str, str, float, str, str]],
+    fuzzy_name_context: bool,
+) -> dict[str, object]:
+    score = 38
+    drivers: list[str] = []
+    penalties: list[str] = []
+
+    if exact_match:
+        score += 24
+        drivers.append("Exact subject string in primary excerpts")
+    elif (
+        selected_analysis_name
+        and search_query.strip().lower() == " ".join(selected_analysis_name.strip().lower().split())
+    ):
+        score += 18
+        drivers.append("Stable subject anchor for this briefing")
+
+    src_types = {(r.source_type or "").lower() for r, _ in evidence_pool if r.source_type}
+    if len(src_types) >= 3:
+        score += 14
+        drivers.append("Multi-source corroboration across independent channel types")
+    elif len(src_types) >= 2:
+        score += 8
+        drivers.append("Cross-source agreement on at least one facet of the pattern")
+
+    repeated_id = 0
+    if len(summary.phones) >= 2:
+        repeated_id += 1
+    if len(summary.vehicles) >= 2:
+        repeated_id += 1
+    if summary.phones and summary.vehicles:
+        repeated_id += 1
+    score += min(14, repeated_id * 5)
+    if repeated_id:
+        drivers.append("Repeated identifiers (phones and/or vehicles) in-pool")
+
+    n_direct = sum(1 for *_, lt in classified_edges if lt == "direct")
+    n_indirect = sum(1 for *_, lt in classified_edges if lt == "indirect")
+    if n_direct >= 2:
+        score += 12
+        drivers.append("Several classified direct links between entities")
+    elif n_direct == 1:
+        score += 6
+    if n_indirect >= 3:
+        score += 4
+
+    combined = " ".join(r.text for r, _ in evidence_pool)
+    if re.search(r"(?i)\b(checkpoint|movement pattern|handover|operational|border watch|tasking|coordination)\b", combined):
+        score += 6
+        drivers.append("Explicit operational or coordination wording")
+
+    dated_snippets = sum(
+        1
+        for r, _ in evidence_pool
+        if re.search(r"\b\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}\b", r.text)
+        or re.search(r"\b\d{4}-\d{2}-\d{2}\b", r.text)
+        or re.search(r"\[\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}", r.text)
+    )
+    if dated_snippets >= 2:
+        score += 5
+        drivers.append("Timeline anchors present in multiple excerpts")
+
+    weak_only = bool(classified_edges) and all(e[4] == "weak" for e in classified_edges)
+    if weak_only:
+        score -= 20
+        penalties.append("Weak-only classified links")
+
+    if fuzzy_name_context:
+        score -= 14
+        penalties.append("Closest-match or fuzzy name alignment")
+
+    if not evidence_pool:
+        score = min(score, 25)
+
+    score = max(0, min(100, score))
+    if score >= 75:
+        level = "High"
+        rationale = "Confidence derived from corroborated identifiers across reports and WhatsApp evidence."
+    elif score >= 48:
+        level = "Medium"
+        rationale = "Confidence reflects solid but incomplete corroboration — validate registrations and subscriber returns where relevant."
+    else:
+        level = "Low"
+        rationale = "Confidence reduced due to weak contextual-only links."
+
+    return {"score": score, "level": level, "rationale": rationale, "drivers": drivers, "penalties": penalties}
 
 
 def extract_alias_evidence(
@@ -1342,8 +1497,16 @@ def _derive_operational_assessment(
                 "Several extracted links classify as direct (evidence-backed phrasing in shared snippets), strengthening association weight for those pairs."
             )
 
-    if re.search(r"(?i)\b(unknown male|unknown female|second party|unidentified)\b", combined):
-        anomalies.append("Incomplete identification of associates (unknown or second-party actors) — identity resolution still open.")
+    associate_ctx = re.search(
+        r"(?i)\b(unknown male|unknown female|second party|unidentified male|unidentified female|"
+        r"unidentified associate|unidentified|another individual|handover counterpart)\b",
+        combined,
+    )
+    if associate_ctx:
+        anomalies.append(
+            "Incomplete identification of associates — retrieved text references an unresolved secondary figure "
+            f"(matched cue: “{associate_ctx.group(1)}”), so role and identity should not be inferred beyond what the source states."
+        )
 
     if re.search(r"(?i)\b(imei|handset cluster|subscriber dump)\b", combined):
         anomalies.append("Technical attribution language (IMEI, handset cluster, bulk subscriber) — valuable as a technical lead, not standalone proof of conduct.")
@@ -1583,11 +1746,36 @@ def build_retrieved_source_summary(
     return "\n".join(bullets)
 
 
+def _extract_contextual_associate_narrative(evidence_pool: list[tuple[ChunkRecord, float]], subject: str) -> str:
+    sub_l = subject.strip().lower()
+    if not sub_l:
+        return ""
+    cue = re.compile(
+        r"(?i)\b(unknown male|unknown female|second party|unidentified male|unidentified associate|"
+        r"another individual|handover counterpart)\b"
+    )
+    loc = re.compile(r"(?i)\b(near block\s+\d+|checkpoint|warehouse|meeting point|gate|tuas)\b")
+    for r, _ in evidence_pool:
+        if sub_l not in r.text.lower():
+            continue
+        if not cue.search(r.text):
+            continue
+        loc_m = loc.search(r.text)
+        where = f" {loc_m.group(0)}" if loc_m else ""
+        return (
+            f"Some field reporting also references interaction alongside a second figure described only in general terms{where}, "
+            "which is consistent with a possible secondary actor; that person's identity and role are not resolved here and should not be assumed."
+        )
+    return ""
+
+
 def _compose_entity_overview_brief(
     subject: str,
     evidence_pool: list[tuple[ChunkRecord, float]],
     summary: EntitySummary,
     exact_match: bool,
+    *,
+    assessment: dict[str, object] | None = None,
 ) -> str:
     sub_l = subject.lower()
     src_types = {(r.source_type or "").lower() for r, _ in evidence_pool}
@@ -1595,10 +1783,10 @@ def _compose_entity_overview_brief(
     if "report" in src_types:
         type_phrase_parts.append("field reports")
     if "whatsapp" in src_types:
-        type_phrase_parts.append("WhatsApp messages")
+        type_phrase_parts.append("WhatsApp exchanges")
     if "email" in src_types:
-        type_phrase_parts.append("email records")
-    type_phrase = ", ".join(type_phrase_parts) if type_phrase_parts else "the retrieved snippets"
+        type_phrase_parts.append("email traffic")
+    type_phrase = ", ".join(type_phrase_parts) if type_phrase_parts else "the indexed excerpts"
 
     date_hits = _dedupe_preserve_order(
         [m.group(0) for r, _ in evidence_pool for m in re.finditer(r"\b\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}\b", r.text)]
@@ -1614,69 +1802,87 @@ def _compose_entity_overview_brief(
         ]
     )
     phone_ord = [p for p, _ in summary.phones.most_common(6)]
-    vehicle_ord = [v for v, _ in summary.vehicles.most_common(6)]
+    vehicle_ord = [v for v, _ in summary.vehicles.most_common(8)]
     email_phone_set = set(_phones_in_email_chunks_for_subject(evidence_pool, subject))
     phones_ops = [p for p in phone_ord if p not in email_phone_set]
     phones_email_only = [p for p in phone_ord if p in email_phone_set]
 
-    subject_parts = [p for p in re.split(r"\s+", sub_l) if p]
-    alias_like = [
-        name
-        for name, _ in summary.persons.most_common(8)
-        if name.strip()
-        and name.strip().lower() != sub_l
-        and any(sp in name.lower() for sp in subject_parts[:1])
-        and len(name.split()) <= 3
-    ]
+    ind_list = list(assessment.get("indicators") or []) if assessment else []
+    risk_tier = str((assessment or {}).get("risk_tier") or "Low")
+    risk_narr = str((assessment or {}).get("risk_narrative") or "").strip()
 
-    opening = (
-        f"{subject} is assessed as the primary subject in the retrieved material, with repeated references across {type_phrase}."
+    # 1–2. Operational overview + movement
+    lead = (
+        f"**{subject}** sits at the centre of this briefing: the excerpts repeatedly place the name inside checkpoint- and movement-flavoured reporting"
         if exact_match
-        else f"{subject} is treated as the likely focus of the retrieved snippets, pending confirmation against official records."
+        else f"**{subject}** is treated here as the analytic anchor, though the query should still be locked to official records where possible"
     )
-
-    paras: list[str] = [opening]
-
-    movement_bits: list[str] = []
+    window = ""
     if date_hits:
-        movement_bits.append(f"dated reporting around {', '.join(date_hits[:3])}")
+        window = f" between **{date_hits[0]}** and **{date_hits[min(2, len(date_hits) - 1)]}**" if len(date_hits) >= 2 else f" around **{date_hits[0]}**"
+    loc_clause = ""
     if location_hits:
-        movement_bits.append(f"location lines such as {', '.join(location_hits[:3])}")
-    if vehicle_ord:
-        movement_bits.append(f"vehicle or plate mentions including {', '.join(vehicle_ord[:3])}")
-    if movement_bits:
-        paras.append(
-            "Further detail in the same pool ties the name to "
-            + ", ".join(movement_bits)
-            + ", consistent with movement and encounter reporting rather than a single isolated mention."
-        )
-
-    if phones_ops:
-        paras.append(
-            f"Operational extracts associate on-file or chat-style numbers {', '.join(phones_ops[:2])} with this identity line."
-        )
-    if phones_email_only and "email" in src_types:
-        paras.append(
-            f"Email evidence in this pool additionally records {', '.join(phones_email_only[:2])}, including where threads carry watch-list or secondary-alert language."
-        )
-
-    if alias_like:
-        paras.append(
-            f"{alias_like[0]} appears as a surface variant; keep it as an alias label only when identifiers overlap in the same cluster."
-        )
-
-    paras.append(
-        "Handling note: prioritise verifying registrations, subscriber or handset returns, and any second-location lines "
-        "that remain only briefly described; the operational risk tier below summarises how hard to lean on this pool."
+        loc_clause = f", including lines on **{', '.join(location_hits[:3])}**"
+    movement = (
+        f"The pattern read across {type_phrase}{window}{loc_clause} is one of repeated operational encounters rather than a single passing name-drop."
+        if (date_hits or location_hits)
+        else f"The pattern read across {type_phrase} is one of repeated operational encounters rather than a single passing name-drop."
     )
 
-    brief = "\n\n".join(paras)
-    brief = _trim_words_max(brief, 220)
-    if len(brief.split()) < 135:
-        brief += (
-            " Analysts should read the Evidence tab for verbatim lines that underpin dates, plates, and numbers."
+    # 3. Identifiers / assets
+    id_bits: list[str] = []
+    if vehicle_ord:
+        id_bits.append(f"vehicles or plates such as **{', '.join(vehicle_ord[:4])}**")
+    if phones_ops:
+        id_bits.append(f"chat- or report-side numbers **{', '.join(phones_ops[:2])}**")
+    if phones_email_only:
+        id_bits.append(f"email-side numbers **{', '.join(phones_email_only[:2])}** (validate before equating to field contact)")
+    identifiers = ""
+    if id_bits:
+        identifiers = "Corroborated cues tie the subject to " + " and ".join(id_bits) + "."
+
+    # 4. Network / associates
+    network = _extract_contextual_associate_narrative(evidence_pool, subject)
+
+    # 5. Operational interpretation (light use of assessment)
+    interp_parts: list[str] = []
+    if ind_list:
+        interp_parts.append(ind_list[0].rstrip("."))
+    if len(ind_list) > 1:
+        interp_parts.append(ind_list[1].rstrip("."))
+    interp = ""
+    if interp_parts:
+        interp = (
+            "Operational indicators include "
+            + "; ".join(interp_parts)
+            + ", but nothing here on its own establishes criminal attribution."
         )
-    return brief
+    else:
+        interp = (
+            "Operational indicators are present chiefly as movement and identifier density; nothing here on its own establishes criminal attribution."
+        )
+
+    # 6–7. Confidence + handling
+    conf_assess = (
+        f"**Confidence read:** this pool carries **{risk_tier.lower()}** operational relevance — {risk_narr}"
+        if risk_narr
+        else f"**Confidence read:** this pool carries **{risk_tier.lower()}** operational relevance pending further corroboration."
+    )
+    handling = (
+        "**Recommended handling:** keep dissemination controlled, validate subscriber and registration returns on the highlighted identifiers, "
+        "and treat any secondary-actor references as intelligence leads rather than resolved identities."
+    )
+
+    parts = [lead + ".", movement]
+    if identifiers:
+        parts.append(identifiers)
+    if network:
+        parts.append(network)
+    parts.append(interp)
+    parts.append(conf_assess)
+    parts.append(handling)
+    brief = "\n\n".join(parts)
+    return _trim_words_max(brief, 320)
 
 
 def build_entity_profile_analyst_summary(
@@ -1692,16 +1898,14 @@ def build_entity_profile_analyst_summary(
     alias_line = ""
     if alias_map:
         pairs = [f"{a} → {b}" for a, b in list(alias_map.items())[:4]]
-        alias_line = " Alias normalisation applied: " + "; ".join(pairs) + "."
+        alias_line = "\n\nAlias normalisation applied: " + "; ".join(pairs) + "."
     people_clause = ", ".join(top_people) if top_people else "no repeated person entities"
     veh_clause = ", ".join(top_veh) if top_veh else "no strong vehicle repeats"
     ph_clause = ", ".join(top_ph) if top_ph else "no phone repeats"
     base = (
-        f"Entity profile summary:\nThe retrieved evidence highlights **{subj}** alongside repeated identifier traffic. "
-        f"People frequency (top counts): {people_clause}. "
-        f"Vehicles / plates: {veh_clause}. "
-        f"Phones (normalised): {ph_clause}.{alias_line} "
-        "Treat high-count overlaps as stronger anchors; single-mention or peripheral tokens remain weak leads until a second source agrees."
+        f"This profile consolidates identifiers, vehicles, phones, and corroborated references linked to **{subj}** "
+        f"across retrieved reporting.\n\n"
+        f"Top frequency snapshot — people: {people_clause}; vehicles / plates: {veh_clause}; phones: {ph_clause}.{alias_line}"
     )
     if operational_assessment:
         base += "\n\n" + _format_operational_compact_for_tabs(operational_assessment)
@@ -1720,12 +1924,17 @@ def build_link_analysis_analyst_summary(
     has_email = any((r.source_type or "").lower() == "email" for r, _ in evidence_pool)
     src_bits = []
     if has_report:
-        src_bits.append("field-report")
+        src_bits.append("field reports")
     if has_wa:
-        src_bits.append("WhatsApp")
+        src_bits.append("WhatsApp messages")
     if has_email:
-        src_bits.append("email")
-    src_phrase = " and ".join(src_bits) if src_bits else "retrieved"
+        src_bits.append("email reporting")
+    if len(src_bits) >= 2:
+        src_phrase = ", ".join(src_bits[:-1]) + ", and " + src_bits[-1]
+    elif src_bits:
+        src_phrase = src_bits[0]
+    else:
+        src_phrase = "retrieved channels"
 
     strong_plates: list[str] = []
     lead_plates: list[str] = []
@@ -1762,19 +1971,21 @@ def build_link_analysis_analyst_summary(
     phone_direct = _dedupe_preserve_order(phone_direct)
     phone_weak = _dedupe_preserve_order([p for p in phone_weak if p not in phone_direct])[:3]
 
-    lines = [
-        f"Link analysis summary:\nThe strongest evidence-backed anchors for **{subject.strip() or 'the subject'}** "
-        f"in this retrieval are "
-    ]
+    subj_disp = subject.strip() or "the subject"
+    opener = (
+        f"Relationship analysis indicates repeated linkage between **{subj_disp}**, contact numbers, and multiple vehicle identifiers "
+        f"across {src_phrase} reporting."
+    )
+    lines: list[str] = [opener, f"Strongest anchors in this slice: "]
     anchor_bits: list[str] = []
     if phone_direct:
         anchor_bits.append(f"phone {', '.join(phone_direct)}")
     if strong_plates:
         anchor_bits.append(f"vehicle / plate {', '.join(strong_plates[:2])}")
     if anchor_bits:
-        lines[0] += f"{', '.join(anchor_bits)}, supported chiefly by {src_phrase} snippets."
+        lines[1] += f"{', '.join(anchor_bits)}."
     else:
-        lines[0] += f"limited; co-mentions are sparse in the current {src_phrase} set."
+        lines[1] += f"limited — co-mentions are sparse in the current {src_phrase} set."
     if lead_plates:
         lines.append(
             f"Plates such as {', '.join(lead_plates)} surface in contextual or observational wording and should be treated as leads, not confirmed use or ownership."
@@ -1837,18 +2048,17 @@ def build_intelligence_summary(
     walker_scaffold = should_activate_walker_scaffold(target_entity or query, selected_analysis_name)
 
     if intent == "entity_overview":
-        narrative = _compose_entity_overview_brief(subject, evidence_pool, summary, exact_match)
         edge_for_op: list[tuple[str, str, float, str, str]] | None = None
         if summary_evidence is None:
             edge_for_op = link_edges_classified
         assessment = _derive_operational_assessment(
             evidence_pool, summary, subject, exact_match, classified_edges=edge_for_op
         )
-        op_md = _format_operational_picture_markdown(assessment)
-        src_summary = build_retrieved_source_summary(evidence_pool, subject)
-        return (
-            f"**Intelligence brief**\n\n{narrative}\n\n{op_md}\n\n**Retrieved source summary**\n{src_summary}"
+        narrative = _compose_entity_overview_brief(
+            subject, evidence_pool, summary, exact_match, assessment=assessment
         )
+        src_summary = build_retrieved_source_summary(evidence_pool, subject)
+        return f"**Intelligence brief**\n\n{narrative}\n\n**Source coverage**\n{src_summary}"
 
     if intent == "entity_resolution":
         left = entity_a.strip() or target_entity.strip() or "Entity A"
@@ -2283,12 +2493,13 @@ def main() -> None:
     if "active_query" not in st.session_state:
         st.session_state.active_query = ""
 
-    query_input = st.text_input(
-        "Search (e.g. a person like **John Tan**)",
-        placeholder="John Tan",
-        key="qbox",
-    )
-    run = st.button("Search", type="primary")
+    with st.form("main_search_form", clear_on_submit=False):
+        query_input = st.text_input(
+            "Search for a person, phone, vehicle",
+            placeholder="John Tan",
+            key="qbox",
+        )
+        run = st.form_submit_button("Search", type="primary")
     if run:
         st.session_state.active_query = query_input.strip()
 
@@ -2300,7 +2511,7 @@ def main() -> None:
     entity_a = normalized_query.get("entity_a", "")
     entity_b = normalized_query.get("entity_b", "")
     if not search_query:
-        st.info("Enter a query and press **Search**.")
+        st.info("Enter a query and press **Search** (or press **Enter**).")
         return
 
     if role == "intel":
@@ -2416,6 +2627,15 @@ def main() -> None:
         primary_evidence = prioritize_offence_evidence(primary_evidence)
         related_evidence = prioritize_offence_evidence(related_evidence)
 
+    subj_for_veh_edges = (selected_analysis_name or _person_phrase_from_query(search_query) or "").strip()
+    if subj_for_veh_edges:
+        edges = _supplement_subject_vehicle_edges(
+            subj_for_veh_edges,
+            summary,
+            primary_evidence + related_evidence,
+            edges,
+        )
+
     walker_edge_labels: dict[tuple[str, str], str] = {}
     edges, walker_edge_labels = merge_walker_case_edges(edges, selected_analysis_name, search_query)
     timeline = supplement_walker_timeline(timeline, selected_analysis_name, search_query)
@@ -2475,6 +2695,19 @@ def main() -> None:
         if role == "admin":
             st.write("DEBUG explicit_alias_confirmed:", alias_result_ui.get("explicit_alias_confirmed"))
             st.write("DEBUG score:", int(score_ui.get("score", 0)))
+    elif intent in {"entity_overview", "offence_summary", "vehicle_lookup", "relationship_lookup"}:
+        fuzzy_ctx = bool(person_query and not exact_person_match and selected_analysis_name)
+        conf_tab = score_evidence_confidence(
+            search_query=search_query,
+            selected_analysis_name=selected_analysis_name,
+            exact_match=has_exact_match(search_query, primary_evidence),
+            evidence_pool=primary_evidence + related_evidence,
+            summary=summary,
+            classified_edges=classified_edges,
+            fuzzy_name_context=fuzzy_ctx,
+        )
+        render_confidence_bar(int(conf_tab["score"]), str(conf_tab["level"]))
+        st.caption(str(conf_tab["rationale"]))
     st.write(
         build_ai_summary(
             ranked,
@@ -2583,14 +2816,6 @@ def main() -> None:
                 operational_assessment=operational_tab_assessment,
             )
         )
-        if role == "admin":
-            st.caption(
-                "This aggregates entities from retrieved evidence. It helps analysts spot repeated names, vehicles and phones, "
-                "but does not confirm identity or relationship."
-            )
-            st.caption(
-                "Alias-like entries are treated as independent mentions unless they are supported by Primary or Linked evidence."
-            )
         c1, c2, c3 = st.columns(3)
         with c1:
             st.metric("Distinct persons", len(summary.persons))
@@ -2625,13 +2850,6 @@ def main() -> None:
                 operational_assessment=operational_tab_assessment,
             )
         )
-        st.caption(
-            "Graph links are analytical aids: solid/direct links are evidence-backed; dashed lines are contextual, co-mentioned, or weak leads."
-        )
-        if role == "admin":
-            st.caption(
-                "Relationship graph is an analytical aid. Direct links are evidence-backed; indirect links show contextual chains; weak links are co-occurrence only."
-            )
         if walker_ctx and role == "admin":
             st.info(LINK_ANALYSIS_SCAFFOLD_NOTE)
             st.markdown(direct_context_markdown())
@@ -2645,19 +2863,8 @@ def main() -> None:
                 "Case #2 / #3 scaffolding applies to this query; switch to the admin account to read the full case narrative blocks."
             )
         st.subheader("Co-occurrence in retrieved chunks")
-        if role == "admin":
-            st.caption(
-                "Same-chunk pairs only. Strength blends co-occurrence count, span proximity inside each chunk, "
-                "and a small boost when the pair appears across more than one source type."
-            )
-            st.caption(
-                "Relationship strength is based on co-occurrence frequency, proximity within text, and whether entities appear "
-                "across multiple source types. Strong means frequent/nearby evidence; Medium means some supporting evidence; "
-                "Weak means indirect or limited evidence."
-            )
-            st.caption("These links indicate textual association only and do not prove a real-world relationship.")
         show_weak = st.checkbox("Show weak co-occurrence links", value=False)
-        if not edges:
+        if not classified_edges:
             st.write("No edges found for this result set.")
         else:
             use_person_centric = walker_ctx or (
