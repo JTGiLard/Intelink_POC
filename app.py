@@ -63,6 +63,13 @@ load_dotenv()
 
 DEBUG_MODE = False
 
+# --- Retrieval / graph trust (Mission board + Evidence tab; tune for prototype demos) ---
+# Hybrid search scores are on the FAISS / hybrid scale used in this app (typically ~0–1+).
+# Edge strengths are raw co-occurrence scores; RELATIONSHIP_EDGE_NORMALIZED_MIN is relative to the strongest edge in the active slice.
+EVIDENCE_RELEVANCE_THRESHOLD_PRIMARY = 0.45
+EVIDENCE_RELEVANCE_THRESHOLD_RELATED = 0.24
+RELATIONSHIP_EDGE_NORMALIZED_MIN = 0.22
+
 
 def _person_phrase_from_query(query: str) -> str:
     """First segment before ``+`` or ``,`` — used for person-style matching (case-insensitive)."""
@@ -1030,24 +1037,116 @@ def _supplement_subject_vehicle_edges(
     return out
 
 
+_BROAD_RETRIEVAL_LEADER = re.compile(
+    r"^(show|find|list|search|summarize|summarise|describe|compare|map|trace|pull|retrieve|get|give|any|all)\b",
+    re.IGNORECASE,
+)
+_BROAD_TOPIC_MARKER = re.compile(
+    r"\b(cases?|incidents?|examples?|records?|reports?|intelligence|patterns?|overview|anything|everything|"
+    r"smuggling|syndicates?|networks?|trends?|offences?|operations?|activity|activities|movement|movements)\b",
+    re.IGNORECASE,
+)
+
+
+def _query_looks_like_specific_entity(*, intent: str, query: str) -> bool:
+    """Short, non-interrogative queries are treated as a concrete entity / subject focus."""
+    if intent in ("relationship_between_entities", "entity_resolution", "timeline"):
+        return False
+    q = (query or "").strip()
+    if not q or len(q) > 140:
+        return False
+    low = q.lower()
+    tokens = low.split()
+    if re.search(
+        r"\b(what|how|why|when|where|which|explain|describe|list|tell\s+me|give\s+me|show\s+me\s+everything)\b",
+        low,
+    ):
+        return False
+    if low.count(" ") >= 14:
+        return False
+    # Broad / desk-research style questions: never apply the strict entity phrase gate.
+    if intent == "general_search" and len(tokens) >= 5:
+        return False
+    if _BROAD_RETRIEVAL_LEADER.match(low.strip()):
+        return False
+    if intent == "general_search" and len(tokens) >= 3 and _BROAD_TOPIC_MARKER.search(low):
+        return False
+    return True
+
+
+def _chunk_matches_query_focus(text: str, query: str, target_entity: str) -> bool:
+    """Whole phrase for multi-token focus; word-boundary match for single-token focus."""
+    focus = _clean_target_entity((target_entity or "").strip() or (query or "").strip()).strip().lower()
+    if not focus or len(focus) < 2:
+        return True
+    tl = " ".join(text.lower().split())
+    if " " in focus:
+        return focus in tl
+    return bool(re.search(rf"\b{re.escape(focus)}\b", tl))
+
+
+def _evidence_entity_text_gate(
+    ranked: list[tuple[ChunkRecord, float]],
+    *,
+    intent: str,
+    query: str,
+    target_entity: str,
+) -> tuple[list[tuple[ChunkRecord, float]], list[tuple[ChunkRecord, float]]]:
+    """Drop chunks that never mention the queried subject when the query looks entity-specific."""
+    if not _query_looks_like_specific_entity(intent=intent, query=query):
+        return list(ranked), []
+    kept: list[tuple[ChunkRecord, float]] = []
+    hidden: list[tuple[ChunkRecord, float]] = []
+    for r, s in ranked:
+        if _chunk_matches_query_focus(r.text, query, target_entity):
+            kept.append((r, s))
+        else:
+            hidden.append((r, s))
+    return kept, hidden
+
+
+def _filter_graph_edges_normalized(
+    edges: list[tuple[str, str, float, str, str]],
+    *,
+    min_normalized: float,
+) -> list[tuple[str, str, float, str, str]]:
+    """Keep only edges whose raw strength is at least a fraction of the strongest edge in this slice."""
+    if not edges:
+        return edges
+    mx = max(float(e[2]) for e in edges)
+    if mx <= 0:
+        return edges
+    return [e for e in edges if (float(e[2]) / mx) >= float(min_normalized)]
+
+
 def _classify_evidence(
     ranked: list[tuple[ChunkRecord, float]],
     query: str,
     *,
     intent: str = "",
     target_entity: str = "",
-) -> tuple[list[tuple[ChunkRecord, float]], list[tuple[ChunkRecord, float]]]:
+) -> tuple[list[tuple[ChunkRecord, float]], list[tuple[ChunkRecord, float]], list[tuple[ChunkRecord, float]]]:
+    """
+    Partition retrieval into primary, related context, and hidden/ignored.
+
+    Primary: structural primary (name / phone / plate in chunk) AND hybrid score >=
+    ``EVIDENCE_RELEVANCE_THRESHOLD_PRIMARY``. Related: structural related, demoted primary,
+    or identifier-linked context above ``EVIDENCE_RELEVANCE_THRESHOLD_RELATED``. Hidden:
+    gated-out noise, identifier orphans, or very low scores.
+    """
+    hidden: list[tuple[ChunkRecord, float]] = []
     if intent == "relationship_between_entities":
-        return list(ranked), []
+        return list(ranked), [], []
     if intent == "identity_lookup" and _is_abang_identity_target(target_entity):
-        return list(ranked), []
+        return list(ranked), [], []
+
     person_phrase = _person_phrase_from_query(query).strip()
     person_two_word = _is_person_like_two_word_query(query)
     phone_norm = normalize_phone_number(query)
     vehicle_norm = _vehicle_query_normalized(query)
 
-    primary: list[tuple[ChunkRecord, float]] = []
-    related: list[tuple[ChunkRecord, float]] = []
+    primary_struct: list[tuple[ChunkRecord, float]] = []
+    related_struct: list[tuple[ChunkRecord, float]] = []
     for r, score in ranked:
         text_l = r.text.lower()
         if person_two_word and person_phrase:
@@ -1063,24 +1162,54 @@ def _classify_evidence(
             is_primary = vehicle_norm in _vehicle_query_normalized(r.text)
         else:
             is_primary = query.strip().lower() in text_l
-        (primary if is_primary else related).append((r, score))
+        (primary_struct if is_primary else related_struct).append((r, score))
+
     if person_two_word and person_phrase:
-        if not primary:
-            related = []
+        if not primary_struct:
+            related_struct = []
         else:
             primary_ids: set[str] = set()
-            for pr, _ in primary:
+            for pr, _ in primary_struct:
                 primary_ids |= _extract_strong_identifiers(pr.text)
             if primary_ids:
                 filtered_related: list[tuple[ChunkRecord, float]] = []
-                for rr, ss in related:
+                for rr, ss in related_struct:
                     related_ids = _extract_strong_identifiers(rr.text)
                     if primary_ids & related_ids:
                         filtered_related.append((rr, ss))
-                related = filtered_related
+                    else:
+                        hidden.append((rr, ss))
+                related_struct = filtered_related
             else:
-                related = []
-    return primary, related
+                for rr, ss in related_struct:
+                    hidden.append((rr, ss))
+                related_struct = []
+
+    primary_out: list[tuple[ChunkRecord, float]] = []
+    demoted_primary: list[tuple[ChunkRecord, float]] = []
+    for r, score in primary_struct:
+        if float(score) >= EVIDENCE_RELEVANCE_THRESHOLD_PRIMARY:
+            primary_out.append((r, score))
+        else:
+            demoted_primary.append((r, score))
+
+    candidate_related = list(related_struct) + list(demoted_primary)
+    related_out: list[tuple[ChunkRecord, float]] = []
+    primary_ids_final: set[str] = set()
+    for pr, _ in primary_out:
+        primary_ids_final |= _extract_strong_identifiers(pr.text)
+
+    for r, score in candidate_related:
+        sc = float(score)
+        if sc >= EVIDENCE_RELEVANCE_THRESHOLD_RELATED:
+            related_out.append((r, score))
+            continue
+        if primary_ids_final and (primary_ids_final & _extract_strong_identifiers(r.text)):
+            related_out.append((r, score))
+            continue
+        hidden.append((r, score))
+
+    return primary_out, related_out, hidden
 
 
 def _text_mentions_entity(text: str, entity: str) -> bool:
@@ -2991,11 +3120,27 @@ def build_intelligence_summary(
             primary_ids |= _strong_summary_identifiers(r.text)
 
         validated_linked: list[tuple[ChunkRecord, float]] = []
-        for r, s in linked_evidence:
-            if primary_ids & _strong_summary_identifiers(r.text):
-                validated_linked.append((r, s))
+        if primary_ids:
+            for r, s in linked_evidence:
+                if primary_ids & _strong_summary_identifiers(r.text):
+                    validated_linked.append((r, s))
+        elif primary_evidence:
+            # Primary excerpts exist but carry no extracted strong identifiers; do not pull unrelated linked text.
+            validated_linked = []
+        else:
+            # No primary-tier excerpts: ground the brief on a capped related pool so the UI does not go silent,
+            # while copy paths below remain explicitly cautious about weak / peripheral context.
+            validated_linked = list(linked_evidence)[:14]
 
         evidence_pool = primary_evidence + validated_linked
+
+    pool_header = ""
+    if summary_evidence is None and not primary_evidence and linked_evidence:
+        pool_header = (
+            "**Evidence note:** No excerpts met the primary relevance threshold; this briefing draws on **related context only**. "
+            "Treat identifiers and relationships below as operational leads, not confirmed facts about the query subject.\n\n"
+        )
+
     all_hits = []
     for r, _ in evidence_pool:
         all_hits.extend(extract_all_entities(r.text))
@@ -3015,7 +3160,7 @@ def build_intelligence_summary(
         body = _compose_relationship_between_intel_brief(left, right, paths)
         subj_pair = f"{left} · {right}"
         src_summary = build_retrieved_source_summary(evidence_pool, subj_pair)
-        return f"**Intelligence brief**\n\n{body}\n\n**Source coverage**\n{src_summary}"
+        return pool_header + f"**Intelligence brief**\n\n{body}\n\n**Source coverage**\n{src_summary}"
 
     if intent == "entity_overview":
         edge_for_op: list[tuple[str, str, float, str, str]] | None = None
@@ -3028,7 +3173,7 @@ def build_intelligence_summary(
             subject, evidence_pool, summary, exact_match, assessment=assessment
         )
         src_summary = build_retrieved_source_summary(evidence_pool, subject)
-        return f"**Intelligence brief**\n\n{narrative}\n\n**Source coverage**\n{src_summary}"
+        return pool_header + f"**Intelligence brief**\n\n{narrative}\n\n**Source coverage**\n{src_summary}"
 
     if intent == "entity_resolution":
         left = entity_a.strip() or target_entity.strip() or "Entity A"
@@ -3147,10 +3292,10 @@ def build_intelligence_summary(
             evidence_pool, summary, subj, em, classified_edges=edge_for_op
         )
         narrative = _compose_entity_overview_brief(subj, evidence_pool, summary, em, assessment=assessment)
-        return f"**Identity lookup — {subj}**\n\n{narrative}"
+        return pool_header + f"**Identity lookup — {subj}**\n\n{narrative}"
 
     if intent == "offence_summary":
-        return (
+        return pool_header + (
             "Summary:\n"
             f"{scope_prefix}{subject} was arrested on 5 May 2017 at the Changi Airfreight Centre in connection with a cigarette smuggling operation. "
             "The offence involved 1,250 cartons of duty-unpaid cigarettes from Jakarta, falsely declared as 'canvas shoes' and loaded into lorry LL010. "
@@ -3172,7 +3317,7 @@ def build_intelligence_summary(
             lines.extend([f"- {v}: co-mentioned only; treat as weak lead." for v in weak_vehicles[:8]])
         body = "\n".join(lines)
         ua = _unknown_associate_standard_sentence(subject, evidence_pool)
-        return body + ("\n\n" + ua if ua else "")
+        return pool_header + body + ("\n\n" + ua if ua else "")
 
     if intent == "relationship_lookup":
         direct, indirect, weak = classify_relationship_rows(evidence_pool, subject)
@@ -3187,7 +3332,7 @@ def build_intelligence_summary(
         ]
         body = "\n".join(lines)
         ua = _unknown_associate_standard_sentence(subject, evidence_pool)
-        return body + ("\n\n" + ua if ua else "")
+        return pool_header + body + ("\n\n" + ua if ua else "")
 
     if exact_match:
         contact_bullets: list[str] = []
@@ -3336,7 +3481,7 @@ def build_intelligence_summary(
     word_limit = 340 if walker_scaffold else 220
     if len(words) > word_limit:
         brief = " ".join(words[:word_limit]).rstrip() + "..."
-    return brief
+    return pool_header + brief
 
 
 def build_ai_summary(
@@ -3414,14 +3559,72 @@ html, body, [class*="css"]  { font-family: 'DM Sans', system-ui, sans-serif; }
   background: radial-gradient(1200px 800px at 10% -10%, rgba(34,211,238,0.08), transparent 55%),
               radial-gradient(900px 600px at 90% 0%, rgba(168,85,247,0.07), transparent 50%),
               linear-gradient(168deg, #030712 0%, #0a1628 42%, #050a14 100%) !important;
-  color: #e2e8f0;
+  color: #b8c7e0;
+}
+/* --- Streamlit chrome: dark command strip instead of bright default header --- */
+header[data-testid="stHeader"] {
+  background: linear-gradient(180deg, rgba(10,18,40,0.94) 0%, rgba(6,10,24,0.88) 100%) !important;
+  border-bottom: 1px solid rgba(56, 189, 248, 0.14);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+}
+header[data-testid="stHeader"] [data-testid="stDecoration"] { display: none; }
+section[data-testid="stMain"] .block-container {
+  background: transparent !important;
+  padding-top: 0.75rem;
+}
+/* Single top search form = translucent command bar */
+section[data-testid="stMain"] form[data-testid="stForm"] {
+  background: linear-gradient(92deg, rgba(12,22,48,0.82) 0%, rgba(8,14,32,0.72) 55%, rgba(10,20,44,0.78) 100%) !important;
+  border: 1px solid rgba(56, 189, 248, 0.18);
+  border-radius: 14px;
+  padding: 0.65rem 1rem 0.85rem 1rem;
+  margin-bottom: 0.5rem;
+  box-shadow: 0 12px 40px rgba(0,0,0,0.35), inset 0 1px 0 rgba(255,255,255,0.04);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+}
+.intelink-command-label {
+  margin: 0.15rem 0 0.45rem 0;
+  font-size: 0.72rem;
+  letter-spacing: 0.28em;
+  text-transform: uppercase;
+  color: #7f93b2;
 }
 section[data-testid="stSidebar"] {
   background: linear-gradient(185deg, rgba(8,15,35,0.97) 0%, rgba(4,8,20,0.99) 100%) !important;
   border-right: 1px solid rgba(56, 189, 248, 0.18);
   box-shadow: 4px 0 32px rgba(0,0,0,0.45);
+  color: #b8c7e0;
 }
 section[data-testid="stSidebar"] .block-container { padding-top: 1rem; }
+section[data-testid="stSidebar"] p,
+section[data-testid="stSidebar"] span,
+section[data-testid="stSidebar"] label,
+section[data-testid="stSidebar"] li {
+  color: #b8c7e0 !important;
+}
+section[data-testid="stSidebar"] h1,
+section[data-testid="stSidebar"] h2,
+section[data-testid="stSidebar"] h3,
+section[data-testid="stSidebar"] h4,
+section[data-testid="stSidebar"] h5,
+section[data-testid="stSidebar"] h6 {
+  color: #e7f1ff !important;
+}
+section[data-testid="stSidebar"] [data-testid="stCaption"],
+section[data-testid="stSidebar"] .stCaption,
+section[data-testid="stSidebar"] small {
+  color: #7f93b2 !important;
+}
+section[data-testid="stSidebar"] [data-baseweb="base-input"] input {
+  color: #e7f1ff !important;
+}
+section[data-testid="stSidebar"] .stButton button {
+  color: #e7f1ff !important;
+  border-color: rgba(56,189,248,0.35) !important;
+}
+section[data-testid="stSidebar"] .stMarkdown strong { color: #edf4ff !important; }
 .intelink-brand {
   font-size: 1.4rem; font-weight: 800; letter-spacing: 0.14em;
   background: linear-gradient(92deg, #22d3ee, #38bdf8 35%, #a78bfa 70%, #c084fc);
@@ -3430,7 +3633,7 @@ section[data-testid="stSidebar"] .block-container { padding-top: 1rem; }
 }
 .intel-chip { display:inline-block; margin:2px 4px 2px 0; padding:3px 8px; border-radius:999px;
   font-size:0.68rem; letter-spacing:0.04em; text-transform:uppercase;
-  border:1px solid rgba(56,189,248,0.25); color:#7dd3fc; background:rgba(15,23,42,0.6); }
+  border:1px solid rgba(56,189,248,0.25); color:#9fdcf9; background:rgba(15,23,42,0.6); }
 .intelink-card {
   background: rgba(15, 23, 42, 0.65);
   border: 1px solid rgba(56, 189, 248, 0.14);
@@ -3439,24 +3642,35 @@ section[data-testid="stSidebar"] .block-container { padding-top: 1rem; }
   margin-bottom: 0.85rem;
   box-shadow: 0 16px 48px rgba(0,0,0,0.4), inset 0 1px 0 rgba(255,255,255,0.04);
 }
+.intelink-graph-card { min-height: 420px; }
+.intelink-assessment-card .stMarkdown p,
+.intelink-assessment-card .stMarkdown li { color: #c7d4ea !important; }
+.intelink-assessment-card .stMarkdown strong { color: #edf4ff !important; }
+.intelink-mission-title {
+  margin: 0.35rem 0 0.75rem 0;
+  font-size: 1.28rem;
+  font-weight: 700;
+  color: #e7f1ff;
+  letter-spacing: 0.02em;
+}
 div[data-testid="stMetric"] {
   background: rgba(15,23,42,0.55);
   border: 1px solid rgba(56,189,248,0.12);
   border-radius: 12px;
   padding: 0.5rem 0.75rem;
 }
-div[data-testid="stMetric"] label { color: #94a3b8 !important; }
-div[data-testid="stMetric"] [data-testid="stMetricValue"] { color: #e0f2fe !important; }
+div[data-testid="stMetric"] label { color: #7f93b2 !important; }
+div[data-testid="stMetric"] [data-testid="stMetricValue"] { color: #d6e6ff !important; }
 .stTextInput input, .stTextArea textarea {
   background: rgba(15,23,42,0.85) !important;
-  color: #f1f5f9 !important;
+  color: #e7f1ff !important;
   border: 1px solid rgba(56,189,248,0.25) !important;
   border-radius: 10px !important;
 }
 .stButton button[kind="primary"] {
   background: linear-gradient(90deg, #0891b2, #2563eb) !important;
   border: none !important;
-  color: white !important;
+  color: #f0f7ff !important;
 }
 .stExpander { background: rgba(15,23,42,0.45); border: 1px solid rgba(51,65,85,0.5); border-radius: 12px; }
 .intel-badge {
@@ -3468,18 +3682,40 @@ div[data-testid="stMetric"] [data-testid="stMetricValue"] { color: #e0f2fe !impo
 .intel-scroll { max-height: 400px; overflow-y: auto; padding-right: 6px; }
 .intel-tl-row { display:flex; gap:10px; align-items:flex-start; margin-bottom:12px; }
 .intel-tl-dot { width:10px; height:10px; border-radius:50%; margin-top:6px; flex-shrink:0; }
-.intel-tl-date { font-size:0.72rem; color:#64748b; letter-spacing:0.04em; text-transform:uppercase; }
-.intel-tl-lbl { font-weight:600; color:#e2e8f0; font-size:0.88rem; }
-.intel-tl-det { font-size:0.8rem; color:#94a3b8; line-height:1.35; }
-.intel-legend-row { display:flex; flex-wrap:wrap; gap:8px 14px; font-size:0.72rem; color:#94a3b8; margin-top:8px; }
+.intel-tl-date { font-size:0.72rem; color:#7f93b2; letter-spacing:0.04em; text-transform:uppercase; }
+.intel-tl-lbl { font-weight:600; color:#e7f1ff; font-size:0.88rem; }
+.intel-tl-det { font-size:0.8rem; color:#b8c7e0; line-height:1.35; }
+.intel-legend-row { display:flex; flex-wrap:wrap; gap:8px 14px; font-size:0.72rem; color:#7f93b2; margin-top:8px; }
 .intel-legend-swatch { display:inline-block; width:10px; height:10px; border-radius:50%; margin-right:5px; vertical-align:middle; }
+.intel-evidence-meta {
+  font-size: 0.78rem;
+  color: #93b7ff;
+  letter-spacing: 0.02em;
+  margin-top: 0.35rem;
+  opacity: 0.95;
+}
+.intel-evidence-hidden-hdr { font-size: 0.76rem; color: #93b7ff; margin-top: 0.5rem; }
+.intel-evidence-hidden-snippet {
+  font-size: 0.8rem;
+  color: #7f93b2;
+  line-height: 1.4;
+  border-left: 2px solid rgba(56,189,248,0.2);
+  padding-left: 8px;
+  margin-bottom: 0.35rem;
+}
+/* Main column alerts: softer panels */
+section[data-testid="stMain"] div[data-testid="stAlert"] {
+  background: rgba(15,23,42,0.75) !important;
+  border: 1px solid rgba(56,189,248,0.15) !important;
+  color: #c7d4ea !important;
+}
 div[data-testid="stTabs"] [data-baseweb="tab"] {
-  color: #64748b !important; font-weight: 500 !important;
+  color: #7f93b2 !important; font-weight: 500 !important;
   border-bottom: 2px solid transparent !important;
 }
 div[data-testid="stTabs"] [data-baseweb="tab"][aria-selected="true"] {
-  color: #22d3ee !important; font-weight: 700 !important;
-  border-bottom: 3px solid #22d3ee !important;
+  color: #7dd3fc !important; font-weight: 700 !important;
+  border-bottom: 3px solid rgba(34,211,238,0.85) !important;
 }
 </style>
 """
@@ -3726,10 +3962,22 @@ def main() -> None:
             st.session_state.clear()
             st.rerun()
 
-    api_key = st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
+    api_key = (os.getenv("OPENAI_API_KEY") or "").strip() or None
     if not api_key:
-        st.error("OPENAI_API_KEY not set")
-        st.stop()
+        try:
+            api_key = (st.secrets.get("OPENAI_API_KEY") or "").strip() or None
+        except Exception:
+            api_key = None
+    if not api_key:
+        st.warning("OpenAI API key not configured")
+        st.info(
+            "**Intelink cannot run embeddings or semantic search without `OPENAI_API_KEY`.**\n\n"
+            "- **Local:** copy `.env.example` to `.env`, set your key, restart; or use `.streamlit/secrets.toml` "
+            "(see `.streamlit/README.md`).\n"
+            "- **Streamlit Cloud:** **Settings → Secrets** → add `OPENAI_API_KEY`.\n\n"
+            "Never commit real keys, `.env`, or `secrets.toml`."
+        )
+        return
     os.environ["OPENAI_API_KEY"] = api_key
 
     try:
@@ -3757,7 +4005,11 @@ def main() -> None:
             st.error(str(e))
             st.stop()
         except Exception as e:
-            st.exception(e)
+            st.error("Could not load or build the vector index for the selected data folder.")
+            st.caption("Check that the data path is readable and dependencies are installed.")
+            if role == "admin":
+                with st.expander("Technical details (admin only)", expanded=False):
+                    st.code(f"{type(e).__name__}: {e}")
             st.stop()
 
     source_files = len({r.source_file for r in store.records})
@@ -3772,7 +4024,7 @@ def main() -> None:
         st.session_state.active_query = ""
 
     st.markdown(
-        '<div style="margin:0.2rem 0 0.75rem 0;font-size:0.72rem;letter-spacing:0.28em;text-transform:uppercase;color:#64748b;">Analyst search</div>',
+        '<div class="intelink-command-label">Analyst search</div>',
         unsafe_allow_html=True,
     )
     with st.form("top_search_bar", clear_on_submit=False):
@@ -3876,12 +4128,24 @@ def main() -> None:
         if role == "admin":
             for alias, canonical in alias_map.items():
                 st.caption(f"Alias normalized: {alias} -> {canonical}")
+    # Entity-focus gate: for short subject-style queries, drop chunks that never mention the target phrase.
+    specific_entity_gate = _query_looks_like_specific_entity(intent=intent, query=search_query)
+    retrieved_before_gate = len(ranked_semantic)
+    ranked_semantic, evidence_ignored_gate = _evidence_entity_text_gate(
+        ranked_semantic,
+        intent=intent,
+        query=search_query,
+        target_entity=target_entity,
+    )
+    retrieved_after_gate = len(ranked_semantic)
+    dropped_by_gate_count = len(evidence_ignored_gate)
     summary_semantic, edges_semantic, timeline_semantic = aggregate_dashboard(ranked_semantic, search_query)
 
     ranked = ranked_semantic
-    primary_evidence, related_evidence = _classify_evidence(
+    primary_evidence, related_evidence, evidence_ignored_classify = _classify_evidence(
         ranked, search_query, intent=intent, target_entity=target_entity
     )
+    evidence_ignored_all: list[tuple[ChunkRecord, float]] = list(evidence_ignored_gate) + list(evidence_ignored_classify)
     summary = summary_semantic
     edges = edges_semantic
     timeline = timeline_semantic
@@ -4129,7 +4393,7 @@ def main() -> None:
     )
 
     st.markdown(
-        '<h2 style="margin:0.35rem 0 0.75rem 0;font-size:1.28rem;font-weight:700;color:#f0f9ff;letter-spacing:0.02em;">Mission board</h2>',
+        '<h2 class="intelink-mission-title">Mission board</h2>',
         unsafe_allow_html=True,
     )
     if role != "intel":
@@ -4161,18 +4425,26 @@ def main() -> None:
         _identity_abang_ctx=_identity_abang_ctx,
         show_weak=show_weak,
     )
+    # Trustworthy graph slice: drop very weak edges relative to the strongest signal in this view.
+    graph_edges_plot = _filter_graph_edges_normalized(
+        graph_edges,
+        min_normalized=RELATIONSHIP_EDGE_NORMALIZED_MIN,
+    )
     gfig = None
     gnote = ""
-    if classified_edges:
+    if classified_edges and graph_edges_plot:
         gfig, gnote = build_entity_link_graph_figure(
             ranked,
-            graph_edges,
+            graph_edges_plot,
             search_query,
             person_centric=use_person_centric,
             anchor_person=anchor_person,
             edge_semantic_labels=walker_edge_labels if walker_edge_labels else None,
+            figure_height=620,
         )
-    strongest_l, most_conn_l = _graph_connection_stats(graph_edges)
+    elif classified_edges and graph_edges and not graph_edges_plot:
+        gnote = ""
+    strongest_l, most_conn_l = _graph_connection_stats(graph_edges_plot or graph_edges)
 
     summary_md = build_ai_summary(
         ranked,
@@ -4209,7 +4481,7 @@ def main() -> None:
     with met1:
         st.metric("Entity signals", int(entity_metric))
     with met2:
-        st.metric("Active relationships", len(graph_edges))
+        st.metric("Active relationships", len(graph_edges_plot or graph_edges))
     with met3:
         st.metric("Source files", int(n_sources_dash))
     with met4:
@@ -4219,18 +4491,27 @@ def main() -> None:
             help=dash_conf_rationale or "Evidence / resolution scoring for this slice.",
         )
 
-    row_a, row_b, row_c = st.columns([1.45, 1.0, 0.95], gap="medium")
+    # Layout: primary row = large Relationship graph (left) + AI assessment / key IDs (right).
+    # Secondary row = top sources + operational notes. Timeline list removed here — use Activity Timeline tab only.
+    row_graph, row_ai = st.columns([1.72, 1.0], gap="medium")
 
-    with row_a:
-        st.markdown('<div class="intelink-card">', unsafe_allow_html=True)
-        st.markdown("###### Link graph")
+    with row_graph:
+        st.markdown('<div class="intelink-card intelink-graph-card">', unsafe_allow_html=True)
+        st.markdown("###### Relationship graph")
         if gfig is not None:
             st.plotly_chart(gfig, use_container_width=True)
         elif not classified_edges:
             st.caption("No co-occurrence edges in this retrieval slice.")
+        elif graph_edges and not graph_edges_plot:
+            st.info(
+                "No relationship edges in this slice met the trust threshold for the main graph view, "
+                "so the chart is hidden to avoid implying weak links are confirmed relationships. "
+                "See **Link Analysis** for the full edge table, or enable **Include weak co-occurrence links** and/or "
+                f"lower `RELATIONSHIP_EDGE_NORMALIZED_MIN` (currently {RELATIONSHIP_EDGE_NORMALIZED_MIN:.2f}) if you need exploratory context."
+            )
         else:
             st.warning("Graph did not render.")
-        if gnote:
+        if gnote and gfig is not None:
             st.caption(gnote)
         st.markdown(
             '<div class="intel-legend-row">'
@@ -4239,6 +4520,7 @@ def main() -> None:
             '<span><span class="intel-legend-swatch" style="background:#fb923c"></span>Phone</span>'
             '<span><span class="intel-legend-swatch" style="background:#a78bfa"></span>Company</span>'
             '<span><span class="intel-legend-swatch" style="background:#64748b"></span>Unknown associate</span>'
+            '<span style="color:#7f93b2;">Edges: solid = direct · dashed = indirect · dotted = weak</span>'
             "</div>",
             unsafe_allow_html=True,
         )
@@ -4246,19 +4528,19 @@ def main() -> None:
         with c_ma:
             st.caption("Strongest link")
             st.markdown(
-                f'<div style="font-size:0.82rem;color:#cbd5e1;">{html.escape(strongest_l, quote=True)}</div>',
+                f'<div style="font-size:0.82rem;color:#b8c7e0;">{html.escape(strongest_l, quote=True)}</div>',
                 unsafe_allow_html=True,
             )
         with c_mb:
             st.caption("Most connected")
             st.markdown(
-                f'<div style="font-size:0.82rem;color:#cbd5e1;">{html.escape(most_conn_l, quote=True)}</div>',
+                f'<div style="font-size:0.82rem;color:#b8c7e0;">{html.escape(most_conn_l, quote=True)}</div>',
                 unsafe_allow_html=True,
             )
         st.markdown("</div>", unsafe_allow_html=True)
 
-    with row_b:
-        st.markdown('<div class="intelink-card">', unsafe_allow_html=True)
+    with row_ai:
+        st.markdown('<div class="intelink-card intelink-assessment-card">', unsafe_allow_html=True)
         st.markdown("###### AI assessment")
         badge_risk = str(operational_tab_assessment.get("risk_tier") or "Low")
         badge_cls = "intel-badge" if badge_risk != "High" else "intel-badge-amber"
@@ -4283,15 +4565,9 @@ def main() -> None:
         if key_ids:
             st.markdown("**Key identifiers**")
             for line in key_ids[:8]:
-                st.markdown(f"- {line}", unsafe_allow_html=True)
+                st.markdown(f"- {line}")
         with st.expander("Full intelligence brief"):
             st.markdown(summary_md)
-        st.markdown("</div>", unsafe_allow_html=True)
-
-    with row_c:
-        st.markdown('<div class="intelink-card intel-scroll">', unsafe_allow_html=True)
-        st.markdown("###### Timeline")
-        st.markdown(_render_timeline_vertical_html(timeline), unsafe_allow_html=True)
         st.markdown("</div>", unsafe_allow_html=True)
 
     row_d, row_e = st.columns([1.1, 1.0], gap="medium")
@@ -4325,17 +4601,6 @@ def main() -> None:
             for x in esc:
                 st.markdown(f"- {x}")
         st.markdown("</div>", unsafe_allow_html=True)
-
-    ph_cols = st.columns(5)
-    ph_labels = ("Live alerts", "Watchlist", "Geo map", "Risk score", "Analyst notes")
-    for i, col in enumerate(ph_cols):
-        with col:
-            st.markdown(
-                f'<div class="intelink-card" style="opacity:0.78;padding:0.65rem 0.75rem;">'
-                f'<div style="font-size:0.68rem;text-transform:uppercase;letter-spacing:0.12em;color:#64748b;">{ph_labels[i]}</div>'
-                f'<div style="font-size:0.78rem;color:#475569;margin-top:4px;">No feed connected</div></div>',
-                unsafe_allow_html=True,
-            )
 
     if conf_tab is not None:
         render_confidence_bar(dash_conf_score, dash_conf_label)
@@ -4373,27 +4638,126 @@ def main() -> None:
                 "ranked results may still include partial mentions or similarly named people."
             )
 
+    debug_retrieval_info: dict[str, object] | None = None
+    if DEBUG_MODE or role == "admin":
+        dropped_gate_preview: list[dict[str, object]] = [
+            {
+                "source_file": (r.source_file or r.doc_id or "")[:220],
+                "chunk_id": (r.chunk_id or "")[:220],
+                "score": round(float(s), 6),
+                "text_preview": (r.text[:180] + ("…" if len(r.text) > 180 else "")).replace("\r", " ").replace("\n", " "),
+            }
+            for r, s in evidence_ignored_gate[:40]
+        ]
+        debug_retrieval_info = {
+            "query": query,
+            "search_query": search_query,
+            "target_entity": target_entity,
+            "intent": intent,
+            "specific_entity_gate": specific_entity_gate,
+            "entity_gate_fired": bool(specific_entity_gate and dropped_by_gate_count > 0),
+            "entity_gate_strict_mode": specific_entity_gate,
+            "retrieved_chunks_before_gate": retrieved_before_gate,
+            "chunks_dropped_by_gate": dropped_by_gate_count,
+            "retrieved_chunks_after_gate": retrieved_after_gate,
+            "primary_evidence_count": len(primary_evidence),
+            "related_context_count": len(related_evidence),
+            "hidden_ignored_count": len(evidence_ignored_all),
+            "classifier_hidden_only_count": len(evidence_ignored_classify),
+            "gate_hidden_only_count": len(evidence_ignored_gate),
+            "thresholds": {
+                "EVIDENCE_RELEVANCE_THRESHOLD_PRIMARY": EVIDENCE_RELEVANCE_THRESHOLD_PRIMARY,
+                "EVIDENCE_RELEVANCE_THRESHOLD_RELATED": EVIDENCE_RELEVANCE_THRESHOLD_RELATED,
+                "RELATIONSHIP_EDGE_NORMALIZED_MIN": RELATIONSHIP_EDGE_NORMALIZED_MIN,
+            },
+            "dropped_by_gate_preview": dropped_gate_preview,
+        }
+
     res_tab, id_tab, ent_tab, rel_tab, time_tab = st.tabs(
         ["Evidence", "Identity Clusters", "Entity Profile", "Link Analysis", "Activity Timeline"]
     )
 
     with res_tab:
+        # Evidence tab: tiered display (primary / related / hidden) and muted excerpt styling (see INTELINK_DASHBOARD_CSS).
         st.subheader("Primary evidence")
-        if not primary_evidence:
-            st.caption("No direct mention found in retrieved chunks for this query.")
-        for r, score in primary_evidence:
-            with st.expander(f"[{r.source_type}] {r.doc_title} — search relevance score {score:.3f}"):
-                st.markdown(highlight_query(r.text[:6000], search_query))
-                st.caption(f"`{r.source_file}` · `{r.chunk_id}`")
-        st.subheader("Linked evidence")
         st.caption(
-            "Shown only when evidence shares strong identifiers with Primary evidence "
-            "(for example phone, vehicle/plate, NRIC, case ID, company, or named associate)."
+            f"Primary excerpts require a direct subject match in snippet text and hybrid relevance ≥ {EVIDENCE_RELEVANCE_THRESHOLD_PRIMARY:.2f}."
         )
-        for r, score in related_evidence:
-            with st.expander(f"[{r.source_type}] {r.doc_title} — search relevance score {score:.3f}"):
+        if not primary_evidence:
+            st.info(
+                "No strong primary evidence found. Review related context or refine the query."
+            )
+        for r, score in primary_evidence:
+            with st.expander(f"[{r.source_type}] {r.doc_title} — relevance {score:.3f} (primary)"):
                 st.markdown(highlight_query(r.text[:6000], search_query))
-                st.caption(f"`{r.source_file}` · `{r.chunk_id}`")
+                st.markdown(
+                    f'<div class="intel-evidence-meta">{html.escape(r.source_file or "", quote=True)} · '
+                    f"{html.escape(r.chunk_id or '', quote=True)}</div>",
+                    unsafe_allow_html=True,
+                )
+        st.subheader("Related context")
+        st.caption(
+            f"Weaker excerpts (relevance ≥ {EVIDENCE_RELEVANCE_THRESHOLD_RELATED:.2f} or shared strong identifiers "
+            "with primary excerpts). Not treated as stand-alone proof of the subject."
+        )
+        if not related_evidence:
+            st.caption("No related-tier excerpts.")
+        for r, score in related_evidence:
+            with st.expander(f"[{r.source_type}] {r.doc_title} — relevance {score:.3f} (related)"):
+                st.markdown(highlight_query(r.text[:6000], search_query))
+                st.markdown(
+                    f'<div class="intel-evidence-meta">{html.escape(r.source_file or "", quote=True)} · '
+                    f"{html.escape(r.chunk_id or '', quote=True)}</div>",
+                    unsafe_allow_html=True,
+                )
+        if evidence_ignored_all:
+            with st.expander(f"Hidden / ignored retrieval ({len(evidence_ignored_all)} chunk(s))", expanded=False):
+                st.caption(
+                    "Excluded by entity-focus gate, score floor, or lack of identifier linkage to primary excerpts."
+                )
+                for r, score in evidence_ignored_all[:40]:
+                    st.markdown(
+                        f'<div class="intel-evidence-hidden-hdr">`{html.escape(r.source_file or "", quote=True)}` · '
+                        f"score {score:.3f}</div>",
+                        unsafe_allow_html=True,
+                    )
+                    st.markdown(
+                        f'<div class="intel-evidence-hidden-snippet">{html.escape(r.text[:420], quote=True)}'
+                        f"{'…' if len(r.text) > 420 else ''}</div>",
+                        unsafe_allow_html=True,
+                    )
+                if len(evidence_ignored_all) > 40:
+                    st.caption(f"…and {len(evidence_ignored_all) - 40} more not listed.")
+
+        # Admin / DEBUG: retrieval gate + evidence tier diagnostics (collapsed; does not affect intel users).
+        if debug_retrieval_info is not None:
+            with st.expander("Debug: retrieval gate and evidence classification", expanded=False):
+                st.caption("Visible only to admin/debug mode. Not shown to analyst users.")
+                _dbg_notes: list[str] = []
+                if debug_retrieval_info.get("specific_entity_gate"):
+                    _dbg_notes.append(
+                        "- If **specific_entity_gate** is true, the system treated the query as a specific entity search."
+                    )
+                if debug_retrieval_info.get("entity_gate_fired"):
+                    _dbg_notes.append(
+                        "- If **entity_gate_fired** is true, some retrieved chunks did not mention the target entity and were hidden."
+                    )
+                if int(debug_retrieval_info.get("primary_evidence_count") or 0) == 0:
+                    _dbg_notes.append(
+                        "- If **primary_evidence_count** is 0, the AI assessment should avoid confirmed language."
+                    )
+                _dbg_notes.append(
+                    "- Low-score dropped chunks are expected and indicate the trust filter is working."
+                )
+                st.markdown("**Interpretation**\n\n" + "\n".join(_dbg_notes))
+                _dbg_body = {k: v for k, v in debug_retrieval_info.items() if k != "dropped_by_gate_preview"}
+                st.json(_dbg_body)
+                st.caption("Chunks dropped by entity-focus gate — safe preview (max 40)")
+                _dbg_prev = debug_retrieval_info.get("dropped_by_gate_preview") or []
+                if _dbg_prev:
+                    st.dataframe(pd.DataFrame(_dbg_prev), use_container_width=True)
+                else:
+                    st.caption("No chunks removed by the entity-focus gate on this run.")
 
     with id_tab:
         if intent == "relationship_between_entities":

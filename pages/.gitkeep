@@ -1,0 +1,2 @@
+# Reserved for optional Streamlit multipage apps (`pages/*.py`).
+# This project currently uses a single entry point: `app.py`.

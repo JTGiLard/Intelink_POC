@@ -14,8 +14,8 @@ from intelligence.entities import normalize_phone_number
 from intelligence.index_store import ChunkRecord
 
 
-GRAPH_TOP_EDGES = 32
-MAX_TOTAL_NODES = 16
+GRAPH_TOP_EDGES = 40
+MAX_TOTAL_NODES = 18
 MAX_CASE_NODES = 4
 EDGE_LABEL_MAX = 6
 INNER_RING_R = 1.05
@@ -474,6 +474,8 @@ def build_entity_link_graph_figure(
     person_centric: bool = False,
     anchor_person: str = "",
     edge_semantic_labels: dict[tuple[str, str], str] | None = None,
+    *,
+    figure_height: int = 560,
 ) -> tuple[go.Figure | None, str]:
     if not edges:
         return None, ""
@@ -539,11 +541,19 @@ def build_entity_link_graph_figure(
                 continue
             x0, y0 = pos[a]
             x1, y1 = pos[b]
-            dash = "solid" if link_type == "direct" else "dash"
+            lt = (link_type or "").strip().lower()
+            if lt == "direct":
+                dash = "solid"
+            elif lt == "weak":
+                dash = "dot"
+            else:
+                dash = "dash"
             norm = float(strength) / max_strength if max_strength > 0 else 0.0
             width = 3.5 + norm * 8.0
-            if link_type == "direct":
+            if lt == "direct":
                 ec = "rgba(34, 211, 238, 0.95)"
+            elif lt == "weak":
+                ec = "rgba(251, 191, 36, 0.55)"
             else:
                 ec = "rgba(148, 163, 184, 0.55)"
             rel_bits = str(lbl).split("|")
@@ -744,6 +754,17 @@ def build_entity_link_graph_figure(
                 hoverinfo="skip",
             )
         )
+        fig.add_trace(
+            go.Scatter(
+                x=[None, None],
+                y=[None, None],
+                mode="lines",
+                line=dict(color="rgba(251,191,36,0.65)", width=3, dash="dot"),
+                name="Weak association",
+                showlegend=True,
+                hoverinfo="skip",
+            )
+        )
 
         fig.update_layout(
             title=dict(text="Relationship graph (current retrieval only)", font=dict(size=15, color="#e2e8f0")),
@@ -763,7 +784,7 @@ def build_entity_link_graph_figure(
             paper_bgcolor="#0a0e1a",
             font=dict(color="#e2e8f0"),
             margin=dict(l=20, r=20, t=56, b=20),
-            height=520,
+            height=int(figure_height),
             annotations=ann,
         )
         return fig, SIMPLIFIED_CAPTION

@@ -1,19 +1,51 @@
 .env
+.env.*
+!.env.example
 venv/
 .venv/
 __pycache__/
 *.pyc
 .cache_index/
-.streamlit/
 .cursor/
 .vscode/
 .idea/
 Thumbs.db
 Desktop.ini
-# Microsoft Office lock files (temporary while a document is open)
+
+# Streamlit — never commit secrets (local UI secrets live here)
+.streamlit/secrets.toml
+.streamlit/**/secrets.toml
+
+# Optional local Streamlit config (uncomment if you do not want to share theme config)
+# .streamlit/config.toml
+
+# Python / packaging
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+coverage.xml
+
+# Node (if you add a frontend later)
+node_modules/
+
+# OS / editor junk
 ~$*.docx
 ~$*.doc
 AppData/
 Documents/
 Downloads/
 OneDrive/
+
+# Nested duplicate checkout (same name as repo root — do not track)
+intel-ai-hackathon/
+
+# Large / generated vector artifacts (if created outside .cache_index)
+*.faiss
+*.index
+*.pkl
+*.pickle
