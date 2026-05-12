@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 import os
 import re
 import shutil
@@ -117,6 +118,16 @@ VEHICLE_LOOKUP_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"^vehicle\s+linked\s+to\s+(.+?)\??$", flags=re.IGNORECASE),
 ]
 
+RELATIONSHIP_BETWEEN_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(r"^how\s+is\s+(.+?)\s+associated\s+with\s+(.+?)\??$", flags=re.IGNORECASE),
+    re.compile(r"^how\s+is\s+(.+?)\s+and\s+(.+?)\s+associated\??$", flags=re.IGNORECASE),
+    re.compile(r"^how\s+are\s+(.+?)\s+and\s+(.+?)\s+associated\??$", flags=re.IGNORECASE),
+    re.compile(r"^how\s+are\s+(.+?)\s+and\s+(.+?)\s+connected\??$", flags=re.IGNORECASE),
+    re.compile(r"^what\s+links\s+(.+?)\s+and\s+(.+?)\??$", flags=re.IGNORECASE),
+    re.compile(r"^relationship\s+between\s+(.+?)\s+and\s+(.+?)\??$", flags=re.IGNORECASE),
+    re.compile(r"^is\s+(.+?)\s+linked\s+to\s+(.+?)\??$", flags=re.IGNORECASE),
+]
+
 RELATIONSHIP_LOOKUP_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"^who\s+is\s+(.+?)\s+linked\s+to\??$", flags=re.IGNORECASE),
     re.compile(r"^show\s+links\s+for\s+(.+?)\??$", flags=re.IGNORECASE),
@@ -213,10 +224,41 @@ def _filter_classified_edges_abang_identity_only(
     return [e for e in edges if _node_in_abang_identity_graph(e[0]) and _node_in_abang_identity_graph(e[1])]
 
 
+def _relationship_between_focus_search_query(entity_a: str, entity_b: str) -> str:
+    ea = _clean_target_entity(entity_a)
+    eb = _clean_target_entity(entity_b)
+    return " ".join(
+        [
+            ea,
+            eb,
+            "shared company",
+            "shared vehicle",
+            "shared phone",
+            "association",
+            "linked",
+            "connected",
+            "operational",
+        ]
+    )
+
+
 def normalize_user_query(raw_query: str) -> dict[str, str]:
     cleaned = " ".join(raw_query.strip().split())
     if not cleaned:
         return {"intent": "general_search", "target_entity": "", "search_query": ""}
+    for pattern in RELATIONSHIP_BETWEEN_PATTERNS:
+        match = pattern.match(cleaned)
+        if match:
+            entity_a = _clean_target_entity(match.group(1))
+            entity_b = _clean_target_entity(match.group(2))
+            if entity_a and entity_b and entity_a.lower() != entity_b.lower():
+                return {
+                    "intent": "relationship_between_entities",
+                    "target_entity": f"{entity_a} / {entity_b}",
+                    "entity_a": entity_a,
+                    "entity_b": entity_b,
+                    "search_query": _relationship_between_focus_search_query(entity_a, entity_b),
+                }
     # Relationship patterns (e.g. "who is X linked to") must run before generic "who is X" identity lookup.
     for pattern in RELATIONSHIP_LOOKUP_PATTERNS:
         match = pattern.match(cleaned)
@@ -995,6 +1037,8 @@ def _classify_evidence(
     intent: str = "",
     target_entity: str = "",
 ) -> tuple[list[tuple[ChunkRecord, float]], list[tuple[ChunkRecord, float]]]:
+    if intent == "relationship_between_entities":
+        return list(ranked), []
     if intent == "identity_lookup" and _is_abang_identity_target(target_entity):
         return list(ranked), []
     person_phrase = _person_phrase_from_query(query).strip()
@@ -1037,6 +1081,288 @@ def _classify_evidence(
             else:
                 related = []
     return primary, related
+
+
+def _text_mentions_entity(text: str, entity: str) -> bool:
+    if not entity.strip():
+        return False
+    needle = " ".join(entity.strip().lower().split())
+    hay = " ".join(text.lower().split())
+    return needle in hay
+
+
+def _filter_ranked_for_pair_relationship(
+    ranked: list[tuple[ChunkRecord, float]],
+    entity_a: str,
+    entity_b: str,
+    *,
+    max_chunks: int = 48,
+) -> list[tuple[ChunkRecord, float]]:
+    """Keep chunks that tie both subjects or one subject to the other's identifier cloud."""
+    ea, eb = _clean_target_entity(entity_a), _clean_target_entity(entity_b)
+    if not ea or not eb:
+        return list(ranked)
+    ids_with_a: set[str] = set()
+    ids_with_b: set[str] = set()
+    for r, _ in ranked:
+        if _text_mentions_entity(r.text, ea):
+            ids_with_a |= _extract_strong_identifiers(r.text)
+        if _text_mentions_entity(r.text, eb):
+            ids_with_b |= _extract_strong_identifiers(r.text)
+    bridge = ids_with_a & ids_with_b
+
+    def relevant(rec: ChunkRecord) -> bool:
+        t = rec.text
+        if _text_mentions_entity(t, ea) and _text_mentions_entity(t, eb):
+            return True
+        ids_here = _extract_strong_identifiers(t)
+        if _text_mentions_entity(t, ea) and (ids_here & ids_with_b):
+            return True
+        if _text_mentions_entity(t, eb) and (ids_here & ids_with_a):
+            return True
+        if bridge and (ids_here & bridge) and (_text_mentions_entity(t, ea) or _text_mentions_entity(t, eb)):
+            return True
+        return False
+
+    out = [(r, s) for r, s in ranked if relevant(r)]
+    if not out:
+        out = [(r, s) for r, s in ranked if _text_mentions_entity(r.text, ea) or _text_mentions_entity(r.text, eb)]
+    out.sort(key=lambda x: -x[1])
+    return out[:max_chunks]
+
+
+def find_shared_relationship_paths(
+    entity_a: str,
+    entity_b: str,
+    classified_edges: list[tuple[str, str, float, str, str]],
+    evidence_pool: list[tuple[ChunkRecord, float]],
+) -> dict[str, object]:
+    """Summarize bridging companies, phones, vehicles, associates, and source files for two entities."""
+    ak = _person_node_key(_clean_target_entity(entity_a))
+    bk = _person_node_key(_clean_target_entity(entity_b))
+    neighbors: dict[str, set[str]] = defaultdict(set)
+    for a, b, *_ in classified_edges:
+        na, nb = _normalize_graph_entity_node(a), _normalize_graph_entity_node(b)
+        if na == nb:
+            continue
+        neighbors[na].add(nb)
+        neighbors[nb].add(na)
+    direct_bridge = sorted(neighbors.get(ak, set()) & neighbors.get(bk, set()))
+
+    def _kind_nodes(prefix: str) -> list[str]:
+        out: list[str] = []
+        for n in direct_bridge:
+            if n.lower().startswith(prefix):
+                out.append(n.split(":", 1)[1] if ":" in n else n)
+        return _dedupe_preserve_order(out)
+
+    associates: list[str] = []
+    for n in direct_bridge:
+        if not n.lower().startswith("person:"):
+            continue
+        body = n.split(":", 1)[1].strip()
+        if body.lower() in (
+            _clean_target_entity(entity_a).lower(),
+            _clean_target_entity(entity_b).lower(),
+        ):
+            continue
+        if body.lower() == "unknown male / second party":
+            continue
+        associates.append(body)
+
+    docs_both: list[str] = []
+    for r, _ in evidence_pool:
+        if _text_mentions_entity(r.text, entity_a) and _text_mentions_entity(r.text, entity_b):
+            docs_both.append(r.source_file)
+    docs_both = _dedupe_preserve_order(docs_both)[:24]
+
+    return {
+        "shared_companies": _kind_nodes("company:"),
+        "shared_phones": _kind_nodes("phone:"),
+        "shared_vehicles": _kind_nodes("vehicle:"),
+        "shared_associates": _dedupe_preserve_order(associates)[:12],
+        "shared_evidence_documents": docs_both,
+        "direct_bridge_nodes": direct_bridge,
+    }
+
+
+def _pair_shortest_path_allowed_nodes(
+    classified_edges: list[tuple[str, str, float, str, str]],
+    entity_a: str,
+    entity_b: str,
+) -> set[str]:
+    ak = _person_node_key(_clean_target_entity(entity_a))
+    bk = _person_node_key(_clean_target_entity(entity_b))
+    neighbors: dict[str, set[str]] = defaultdict(set)
+    for a, b, *_rest in classified_edges:
+        na, nb = _normalize_graph_entity_node(a), _normalize_graph_entity_node(b)
+        if na == nb:
+            continue
+        neighbors[na].add(nb)
+        neighbors[nb].add(na)
+
+    direct_bridge = neighbors.get(ak, set()) & neighbors.get(bk, set())
+    unk_l = UNKNOWN_ASSOCIATE_NODE_KEY.lower()
+
+    def _struct_ok(n: str) -> bool:
+        nl = n.lower()
+        if n in (ak, bk):
+            return True
+        if n in direct_bridge:
+            return True
+        if nl.startswith(("phone:", "vehicle:", "company:", "case:", "nric:")):
+            return True
+        return nl == unk_l
+
+    dist_a: dict[str, int] = {ak: 0}
+    dq: deque[str] = deque([ak])
+    while dq:
+        u = dq.popleft()
+        for v in neighbors.get(u, ()):
+            if v not in dist_a:
+                dist_a[v] = dist_a[u] + 1
+                dq.append(v)
+    if bk not in dist_a:
+        return {ak, bk} | set(direct_bridge)
+
+    d_target = dist_a[bk]
+    dist_b: dict[str, int] = {bk: 0}
+    dq2: deque[str] = deque([bk])
+    while dq2:
+        u = dq2.popleft()
+        for v in neighbors.get(u, ()):
+            if v not in dist_b:
+                dist_b[v] = dist_b[u] + 1
+                dq2.append(v)
+    on_shortest = {n for n in dist_a if n in dist_b and dist_a[n] + dist_b[n] == d_target}
+    pruned = {n for n in on_shortest if _struct_ok(n)} | {ak, bk}
+    if direct_bridge:
+        pruned |= direct_bridge
+    return pruned
+
+
+def filter_classified_edges_for_pair_graph(
+    classified_edges: list[tuple[str, str, float, str, str]],
+    entity_a: str,
+    entity_b: str,
+) -> list[tuple[str, str, float, str, str]]:
+    allowed = _pair_shortest_path_allowed_nodes(classified_edges, entity_a, entity_b)
+    out: list[tuple[str, str, float, str, str]] = []
+    for e in classified_edges:
+        na, nb = _normalize_graph_entity_node(e[0]), _normalize_graph_entity_node(e[1])
+        if na in allowed and nb in allowed:
+            out.append(e)
+    return _dedupe_classified_edges_max_strength(out) if out else []
+
+
+def _filter_timeline_for_relationship_pair(
+    timeline: list[TimelineEvent],
+    evidence_pool: list[tuple[ChunkRecord, float]],
+    entity_a: str,
+    entity_b: str,
+    bridge_tokens: set[str],
+) -> list[TimelineEvent]:
+    chunk_text = {r.chunk_id: r.text for r, _ in evidence_pool}
+
+    def chunk_ok(cid: str) -> bool:
+        text = chunk_text.get(cid, "")
+        if not text:
+            return False
+        if _text_mentions_entity(text, entity_a) and _text_mentions_entity(text, entity_b):
+            return True
+        tl = text.lower()
+        if _text_mentions_entity(text, entity_a) or _text_mentions_entity(text, entity_b):
+            for tok in bridge_tokens:
+                if tok and tok.lower() in tl:
+                    return True
+        return False
+
+    return [e for e in timeline if chunk_ok(e.chunk_id)]
+
+
+def _bridge_tokens_from_paths(paths: dict[str, object]) -> set[str]:
+    out: set[str] = set()
+    for k in ("shared_companies", "shared_phones", "shared_vehicles"):
+        for x in paths.get(k) or []:
+            t = str(x).strip()
+            if t:
+                out.add(t)
+    for n in paths.get("direct_bridge_nodes") or []:
+        if isinstance(n, str) and ":" in n:
+            t = n.split(":", 1)[1].strip()
+            if t:
+                out.add(t)
+    return out
+
+
+def build_pair_shared_entity_profile_markdown(paths: dict[str, object], entity_a: str, entity_b: str) -> str:
+    ea, eb = _clean_target_entity(entity_a), _clean_target_entity(entity_b)
+    lines = [
+        f"### Shared relationship profile: **{ea}** and **{eb}**",
+        "",
+        "This view is restricted to identifiers and sources that connect **both** subjects in the focused retrieval slice.",
+        "",
+    ]
+    companies = list(paths.get("shared_companies") or [])
+    phones = list(paths.get("shared_phones") or [])
+    vehicles = list(paths.get("shared_vehicles") or [])
+    assoc = list(paths.get("shared_associates") or [])
+    docs = list(paths.get("shared_evidence_documents") or [])
+
+    def _bullets(title: str, items: list[str]) -> None:
+        lines.append(f"**{title}**")
+        if items:
+            for it in items[:16]:
+                lines.append(f"- {it}")
+        else:
+            lines.append("- None clearly extracted in this slice.")
+        lines.append("")
+
+    _bullets("Shared companies", companies)
+    _bullets("Shared phones", phones)
+    _bullets("Shared vehicles / plates", vehicles)
+    _bullets("Shared associates (named third parties on bridging edges)", assoc)
+    _bullets("Shared evidence files (chunks mentioning both names)", docs)
+    return "\n".join(lines).rstrip()
+
+
+def _compose_relationship_between_intel_brief(
+    entity_a: str,
+    entity_b: str,
+    paths: dict[str, object],
+) -> str:
+    ea, eb = _clean_target_entity(entity_a), _clean_target_entity(entity_b)
+    companies = list(paths.get("shared_companies") or [])
+    phones = list(paths.get("shared_phones") or [])
+    vehicles = list(paths.get("shared_vehicles") or [])
+    docs = list(paths.get("shared_evidence_documents") or [])
+    bridge = ", ".join(companies[:4]) if companies else "shared company-related references"
+    if companies and len(companies) > 1:
+        bridge = " / ".join(companies[:3])
+    lines = [
+        f"Retrieved evidence suggests **{ea}** and **{eb}** are indirectly associated through {bridge} within operational reporting.",
+        "",
+        "The relationship is not described as a direct personal interaction. Instead, the linkage appears through "
+        "company-related references and overlapping operational identifiers.",
+        "",
+        "Evidence supporting this association includes:",
+        "- shared company references",
+        "- co-occurrence within linked reporting",
+        "- overlapping operational context",
+    ]
+    if phones:
+        lines.append(f"- shared or co-cited contact cues ({', '.join(phones[:3])})")
+    if vehicles:
+        lines.append(f"- vehicle or plate overlap ({', '.join(vehicles[:3])})")
+    if docs:
+        lines.append(f"- overlapping source files ({', '.join(docs[:4])})")
+    lines.extend(
+        [
+            "",
+            "Current evidence supports an **inferred operational association** rather than confirmed direct coordination.",
+        ]
+    )
+    return "\n\n".join(lines)
 
 
 def aggregate_dashboard(
@@ -2511,6 +2837,25 @@ def build_link_analysis_analyst_summary(
     entity_a: str = "",
     entity_b: str = "",
 ) -> str:
+    if intent == "relationship_between_entities" and entity_a.strip() and entity_b.strip():
+        paths = find_shared_relationship_paths(entity_a, entity_b, classified_edges, evidence_pool)
+        ea = _clean_target_entity(entity_a)
+        eb = _clean_target_entity(entity_b)
+        companies = list(paths.get("shared_companies") or [])
+        if companies:
+            comp_txt = ", ".join(companies[:4])
+            bridge = f"shared company-related references ({comp_txt})"
+        elif paths.get("shared_phones"):
+            bridge = "shared contact identifiers in operational excerpts"
+        elif paths.get("shared_vehicles"):
+            bridge = "shared vehicle or plate mentions"
+        else:
+            bridge = "overlapping operational reporting cues"
+        return (
+            f"Relationship analysis for **{ea}** and **{eb}** identified indirect association paths through {bridge}. "
+            "The read is scoped strictly to evidence that names **both** parties or bridges them via corroborated identifiers."
+        )
+
     if (
         intent in ("entity_resolution", "identity_lookup")
         and alias_result
@@ -2655,7 +3000,22 @@ def build_intelligence_summary(
     for r, _ in evidence_pool:
         all_hits.extend(extract_all_entities(r.text))
     summary = summarize_entities(all_hits)
-    walker_scaffold = should_activate_walker_scaffold(target_entity or query, selected_analysis_name)
+    walker_scaffold = intent != "relationship_between_entities" and should_activate_walker_scaffold(
+        target_entity or query, selected_analysis_name
+    )
+
+    if intent == "relationship_between_entities":
+        left = entity_a.strip()
+        right = entity_b.strip()
+        if not left or not right:
+            parts = [p.strip() for p in (target_entity or "").split("/") if p.strip()]
+            if len(parts) >= 2:
+                left, right = parts[0], parts[1]
+        paths = find_shared_relationship_paths(left, right, link_edges_classified or [], evidence_pool)
+        body = _compose_relationship_between_intel_brief(left, right, paths)
+        subj_pair = f"{left} · {right}"
+        src_summary = build_retrieved_source_summary(evidence_pool, subj_pair)
+        return f"**Intelligence brief**\n\n{body}\n\n**Source coverage**\n{src_summary}"
 
     if intent == "entity_overview":
         edge_for_op: list[tuple[str, str, float, str, str]] | None = None
@@ -3046,6 +3406,238 @@ def _filter_edges_for_selected_name(
     return [e for e in edges if e[0].lower() == selected_key or e[1].lower() == selected_key]
 
 
+INTELINK_DASHBOARD_CSS = """
+<style>
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,600;0,9..40,700;1,9..40,400&display=swap');
+html, body, [class*="css"]  { font-family: 'DM Sans', system-ui, sans-serif; }
+.stApp {
+  background: radial-gradient(1200px 800px at 10% -10%, rgba(34,211,238,0.08), transparent 55%),
+              radial-gradient(900px 600px at 90% 0%, rgba(168,85,247,0.07), transparent 50%),
+              linear-gradient(168deg, #030712 0%, #0a1628 42%, #050a14 100%) !important;
+  color: #e2e8f0;
+}
+section[data-testid="stSidebar"] {
+  background: linear-gradient(185deg, rgba(8,15,35,0.97) 0%, rgba(4,8,20,0.99) 100%) !important;
+  border-right: 1px solid rgba(56, 189, 248, 0.18);
+  box-shadow: 4px 0 32px rgba(0,0,0,0.45);
+}
+section[data-testid="stSidebar"] .block-container { padding-top: 1rem; }
+.intelink-brand {
+  font-size: 1.4rem; font-weight: 800; letter-spacing: 0.14em;
+  background: linear-gradient(92deg, #22d3ee, #38bdf8 35%, #a78bfa 70%, #c084fc);
+  -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+.intel-chip { display:inline-block; margin:2px 4px 2px 0; padding:3px 8px; border-radius:999px;
+  font-size:0.68rem; letter-spacing:0.04em; text-transform:uppercase;
+  border:1px solid rgba(56,189,248,0.25); color:#7dd3fc; background:rgba(15,23,42,0.6); }
+.intelink-card {
+  background: rgba(15, 23, 42, 0.65);
+  border: 1px solid rgba(56, 189, 248, 0.14);
+  border-radius: 14px;
+  padding: 1rem 1.15rem;
+  margin-bottom: 0.85rem;
+  box-shadow: 0 16px 48px rgba(0,0,0,0.4), inset 0 1px 0 rgba(255,255,255,0.04);
+}
+div[data-testid="stMetric"] {
+  background: rgba(15,23,42,0.55);
+  border: 1px solid rgba(56,189,248,0.12);
+  border-radius: 12px;
+  padding: 0.5rem 0.75rem;
+}
+div[data-testid="stMetric"] label { color: #94a3b8 !important; }
+div[data-testid="stMetric"] [data-testid="stMetricValue"] { color: #e0f2fe !important; }
+.stTextInput input, .stTextArea textarea {
+  background: rgba(15,23,42,0.85) !important;
+  color: #f1f5f9 !important;
+  border: 1px solid rgba(56,189,248,0.25) !important;
+  border-radius: 10px !important;
+}
+.stButton button[kind="primary"] {
+  background: linear-gradient(90deg, #0891b2, #2563eb) !important;
+  border: none !important;
+  color: white !important;
+}
+.stExpander { background: rgba(15,23,42,0.45); border: 1px solid rgba(51,65,85,0.5); border-radius: 12px; }
+.intel-badge {
+  display:inline-block; padding:2px 10px; border-radius:999px; font-size:0.75rem; font-weight:600;
+  border:1px solid rgba(34,211,238,0.35); color:#a5f3fc; background:rgba(6,182,212,0.12); margin-right:6px;
+}
+.intel-badge-amber { border-color:rgba(251,191,36,0.4); color:#fde68a; background:rgba(245,158,11,0.12); }
+.intel-badge-violet { border-color:rgba(167,139,250,0.45); color:#ddd6fe; background:rgba(139,92,246,0.12); }
+.intel-scroll { max-height: 400px; overflow-y: auto; padding-right: 6px; }
+.intel-tl-row { display:flex; gap:10px; align-items:flex-start; margin-bottom:12px; }
+.intel-tl-dot { width:10px; height:10px; border-radius:50%; margin-top:6px; flex-shrink:0; }
+.intel-tl-date { font-size:0.72rem; color:#64748b; letter-spacing:0.04em; text-transform:uppercase; }
+.intel-tl-lbl { font-weight:600; color:#e2e8f0; font-size:0.88rem; }
+.intel-tl-det { font-size:0.8rem; color:#94a3b8; line-height:1.35; }
+.intel-legend-row { display:flex; flex-wrap:wrap; gap:8px 14px; font-size:0.72rem; color:#94a3b8; margin-top:8px; }
+.intel-legend-swatch { display:inline-block; width:10px; height:10px; border-radius:50%; margin-right:5px; vertical-align:middle; }
+div[data-testid="stTabs"] [data-baseweb="tab"] {
+  color: #64748b !important; font-weight: 500 !important;
+  border-bottom: 2px solid transparent !important;
+}
+div[data-testid="stTabs"] [data-baseweb="tab"][aria-selected="true"] {
+  color: #22d3ee !important; font-weight: 700 !important;
+  border-bottom: 3px solid #22d3ee !important;
+}
+</style>
+"""
+
+
+def _intelink_intent_history_icon(intent: str) -> str:
+    if intent in ("entity_resolution", "identity_lookup"):
+        return "⛓"
+    if intent == "relationship_between_entities":
+        return "🔗"
+    if intent in ("vehicle_lookup",):
+        return "🚗"
+    if intent in ("relationship_lookup",):
+        return "🕸"
+    if intent in ("entity_overview", "general_search", "offence_summary"):
+        return "👤"
+    return "🔎"
+
+
+def _intelink_record_query_history(query: str, intent: str) -> None:
+    q = (query or "").strip()
+    if not q:
+        return
+    hist: list[dict[str, str]] = st.session_state.setdefault("intelink_query_history", [])
+    if hist and hist[0].get("q") == q:
+        return
+    hist.insert(0, {"q": q, "intent": intent, "ts": datetime.now().strftime("%Y-%m-%d %H:%M")})
+    st.session_state["intelink_query_history"] = hist[:20]
+
+
+def _dashboard_prepare_graph_edges(
+    *,
+    intent: str,
+    entity_a: str,
+    entity_b: str,
+    search_query: str,
+    selected_analysis_name: str | None,
+    ranked: list[tuple[ChunkRecord, float]],
+    primary_evidence: list[tuple[ChunkRecord, float]],
+    related_evidence: list[tuple[ChunkRecord, float]],
+    classified_edges: list[tuple[str, str, float, str, str]],
+    non_weak_edges: list[tuple[str, str, float, str, str]],
+    weak_edges: list[tuple[str, str, float, str, str]],
+    walker_ctx: bool,
+    _identity_abang_ctx: bool,
+    show_weak: bool,
+) -> tuple[list[tuple[str, str, float, str, str]], bool, str]:
+    pool = list(primary_evidence) + list(related_evidence)
+    canonical_res = None
+    if intent == "entity_resolution" or _identity_abang_ctx:
+        canonical_res = _infer_canonical_identity_from_evidence(pool)
+    use_person_centric = walker_ctx or (
+        bool(canonical_res) and intent in ("entity_resolution", "identity_lookup")
+    ) or (_is_person_like_two_word_query(search_query) and has_exact_full_name_hit(ranked, search_query))
+    if walker_ctx:
+        anchor_person = walker_graph_anchor_person(selected_analysis_name)
+    elif intent == "entity_resolution" and canonical_res:
+        anchor_person = canonical_res
+    elif _identity_abang_ctx and canonical_res:
+        anchor_person = canonical_res
+    elif use_person_centric:
+        anchor_person = _person_phrase_from_query(search_query)
+    else:
+        anchor_person = ""
+    if intent == "relationship_between_entities" and entity_a and entity_b:
+        graph_edges = list(non_weak_edges)
+        if show_weak:
+            graph_edges = _dedupe_classified_edges_max_strength(graph_edges + list(weak_edges))
+        return graph_edges, True, entity_a.strip()
+    if (
+        use_person_centric
+        and anchor_person
+        and not walker_ctx
+        and intent != "entity_resolution"
+        and not _identity_abang_ctx
+    ):
+        return (
+            build_subject_relationship_subgraph(
+                classified_edges,
+                anchor_person,
+                show_weak=show_weak,
+            ),
+            True,
+            anchor_person,
+        )
+    graph_edges = list(non_weak_edges)
+    if show_weak:
+        graph_edges = _dedupe_classified_edges_max_strength(graph_edges + list(weak_edges))
+    return graph_edges, use_person_centric, anchor_person
+
+
+def _intelink_summary_card_body(full_markdown: str, max_chars: int = 900) -> str:
+    t = (full_markdown or "").strip()
+    if len(t) <= max_chars:
+        return t
+    return t[: max_chars - 1].rstrip() + "…"
+
+
+def _intelink_top_sources_rows(
+    ranked: list[tuple[ChunkRecord, float]],
+    limit: int = 8,
+) -> list[tuple[str, str, float, str]]:
+    """(source_file, source_type, best_score, doc_title) unique by file."""
+    best: dict[str, tuple[str, float, str]] = {}
+    for r, sc in ranked:
+        fn = r.source_file or r.doc_id or "unknown"
+        stype = (r.source_type or "").strip() or "—"
+        title = (r.doc_title or "")[:120]
+        if fn not in best or sc > best[fn][1]:
+            best[fn] = (stype, float(sc), title)
+    rows = sorted(((fn, t[0], t[1], t[2]) for fn, t in best.items()), key=lambda x: -x[2])[:limit]
+    return rows
+
+
+def _graph_connection_stats(
+    graph_edges: list[tuple[str, str, float, str, str]],
+) -> tuple[str, str]:
+    """Return (strongest link label, most connected node label)."""
+    from collections import Counter
+
+    if not graph_edges:
+        return "—", "—"
+    deg: Counter[str] = Counter()
+    for a, b, *_rest in graph_edges:
+        deg[a] += 1
+        deg[b] += 1
+    best = max(graph_edges, key=lambda e: float(e[2]))
+    hub = max(deg, key=deg.get)
+
+    def _short(nid: str) -> str:
+        return nid.split(":", 1)[-1].strip() if ":" in nid else nid
+
+    strongest = f"{_short(best[0])} ↔ {_short(best[1])} · {float(best[2]):.2f}"
+    most = f"{_short(hub)} · {deg[hub]} edges"
+    return strongest, most
+
+
+def _render_timeline_vertical_html(events: list[TimelineEvent], limit: int = 40) -> str:
+    if not events:
+        return '<p style="color:#94a3b8;font-size:0.85rem;">No dated events in this slice.</p>'
+    parts: list[str] = []
+    palette = ("#22d3ee", "#34d399", "#a78bfa", "#38bdf8", "#f472b6")
+    for i, e in enumerate(sorted(events, key=lambda x: timeline_sort_key(x.when))[:limit]):
+        when_s = html.escape(str(e.when) if e.when is not None else "—", quote=True)
+        col = palette[i % len(palette)]
+        lab = html.escape(str(e.label), quote=True)
+        det = e.detail or ""
+        det_s = html.escape(det[:220] + ("…" if len(det) > 220 else ""), quote=True)
+        parts.append(
+            f'<div class="intel-tl-row">'
+            f'<span class="intel-tl-dot" style="background:{col};box-shadow:0 0 10px {col}88"></span>'
+            f'<div><div class="intel-tl-date">{when_s}</div>'
+            f'<div class="intel-tl-lbl">{lab}</div>'
+            f'<div class="intel-tl-det">{det_s}</div></div></div>'
+        )
+    return "".join(parts)
+
+
 def _render_login_gate() -> bool:
     if "authenticated" not in st.session_state:
         st.session_state["authenticated"] = False
@@ -3068,7 +3660,12 @@ def _render_login_gate() -> bool:
 
 
 def main() -> None:
-    st.set_page_config(page_title="Intel Search", layout="wide", initial_sidebar_state="expanded")
+    st.set_page_config(
+        page_title="INTELINK",
+        layout="wide",
+        initial_sidebar_state="expanded",
+        page_icon="🛡",
+    )
     if st.query_params.get("reset") == "1":
         st.session_state.clear()
         st.query_params.clear()
@@ -3078,26 +3675,7 @@ def main() -> None:
     if not _render_login_gate():
         st.stop()
     role = st.session_state.get("role")
-    if role == "intel":
-        st.markdown(
-            """
-            <style>
-                section[data-testid="stSidebar"] {display: none;}
-            </style>
-            """,
-            unsafe_allow_html=True,
-        )
-
-    st.sidebar.empty()
-    col1, col2 = st.columns([8, 1])
-    with col2:
-        if st.button("Logout"):
-            st.session_state.clear()
-            st.rerun()
-
-    st.title("AI-powered intelligence search")
-    if role == "admin":
-        st.caption("Semantic search with FAISS, OpenAI embeddings, and entity-aware analytics.")
+    st.markdown(INTELINK_DASHBOARD_CSS, unsafe_allow_html=True)
 
     default_data_path = Path(__file__).resolve().parent / "data"
     data_root = default_data_path
@@ -3106,14 +3684,47 @@ def main() -> None:
     top_k = 15
     keyword_boost = 0.12
     clear_active_search = False
-    if role == "admin":
-        with st.sidebar:
-            st.caption("Logged in as admin")
-            data_root = Path(st.text_input("Data folder", value=str(default_data_path)))
+
+    with st.sidebar:
+        st.markdown('<div class="intelink-brand">INTELINK</div>', unsafe_allow_html=True)
+        st.caption("Analyst workstation · intelligence briefing")
+        st.markdown(
+            '<div><span class="intel-chip">AI semantic search</span>'
+            '<span class="intel-chip">Entity resolution</span>'
+            '<span class="intel-chip">Link analysis</span>'
+            '<span class="intel-chip">AI summarisation</span></div>',
+            unsafe_allow_html=True,
+        )
+        if role == "admin":
+            st.markdown("---")
+            st.caption("Operator settings")
+            data_root = Path(st.text_input("Data folder", value=str(default_data_path), key="intel_data_root"))
             use_cache = st.toggle("Use disk cache for index", value=True)
             rebuild_now = st.button("Rebuild index now")
             top_k = st.slider("Results (FAISS top-K)", min_value=5, max_value=50, value=15)
             keyword_boost = st.slider("Keyword boost for hybrid ranking", 0.0, 0.25, 0.12)
+        st.markdown("---")
+        st.markdown("###### Past query history")
+        hist = st.session_state.get("intelink_query_history", [])
+        if not hist:
+            st.caption("No saved queries yet.")
+        for i, item in enumerate(hist[:18]):
+            qtxt = item.get("q", "")
+            short = (qtxt[:44] + "…") if len(qtxt) > 44 else qtxt
+            label = f"{_intelink_intent_history_icon(item.get('intent', ''))} {short}"
+            if st.button(label, key=f"ihist_{i}", help=item.get("ts", "")):
+                st.session_state["active_query"] = qtxt
+                st.rerun()
+        if st.button("Clear query history", key="intelink_hist_clear"):
+            st.session_state["intelink_query_history"] = []
+            st.rerun()
+        if role == "admin":
+            clear_active_search = st.button("Clear active search", key="intelink_clear_active")
+        st.markdown("---")
+        st.caption(f"Signed in as **{role}**")
+        if st.button("Logout", use_container_width=True, type="secondary"):
+            st.session_state.clear()
+            st.rerun()
 
     api_key = st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
     if not api_key:
@@ -3152,7 +3763,6 @@ def main() -> None:
     source_files = len({r.source_file for r in store.records})
     if role == "admin":
         st.sidebar.success(f"Indexed **{len(store.records)}** chunks from **{source_files}** source files.")
-        clear_active_search = st.sidebar.button("Clear active search")
     if clear_active_search:
         st.session_state.pop("active_query", None)
         if "qbox" in st.session_state:
@@ -3161,15 +3771,24 @@ def main() -> None:
     if "active_query" not in st.session_state:
         st.session_state.active_query = ""
 
-    with st.form("main_search_form", clear_on_submit=False):
-        query_input = st.text_input(
-            "Search for a person, phone, vehicle",
-            placeholder="John Tan",
-            key="qbox",
-        )
-        run = st.form_submit_button("Search", type="primary")
+    st.markdown(
+        '<div style="margin:0.2rem 0 0.75rem 0;font-size:0.72rem;letter-spacing:0.28em;text-transform:uppercase;color:#64748b;">Analyst search</div>',
+        unsafe_allow_html=True,
+    )
+    with st.form("top_search_bar", clear_on_submit=False):
+        sb1, sb2 = st.columns([7, 1], gap="small")
+        with sb1:
+            query_input = st.text_input(
+                "Search",
+                placeholder="Person · vehicle · phone · relationship…",
+                key="qbox",
+                label_visibility="collapsed",
+            )
+        with sb2:
+            st.markdown('<div style="height:0.35rem"></div>', unsafe_allow_html=True)
+            run = st.form_submit_button("Search", type="primary", use_container_width=True)
     if run:
-        st.session_state.active_query = query_input.strip()
+        st.session_state.active_query = (query_input or "").strip()
 
     query = (st.session_state.active_query or "").strip()
     normalized_query = normalize_user_query(query)
@@ -3182,6 +3801,8 @@ def main() -> None:
         st.info("Enter a query and press **Search** (or press **Enter**).")
         return
 
+    _intelink_record_query_history(query, intent)
+
     if role == "intel":
         st.info(f"Query focus: **{target_entity}**")
     else:
@@ -3189,7 +3810,7 @@ def main() -> None:
 
     query_token = _person_phrase_from_query(search_query).strip()
     broad_single_token = (
-        intent != "identity_lookup"
+        intent not in ("identity_lookup", "relationship_between_entities")
         and _is_single_token_person_like_query(search_query)
         and len(query_token) >= 3
         and not _is_person_like_two_word_query(search_query)
@@ -3236,6 +3857,12 @@ def main() -> None:
     qv = embed_texts([search_query])
     raw_hits = store.search(qv[0], k=top_k)
     ranked_semantic = hybrid_rank(raw_hits, search_query, keyword_boost=keyword_boost)
+    if intent == "relationship_between_entities" and entity_a and entity_b:
+        ranked_semantic = _filter_ranked_for_pair_relationship(
+            ranked_semantic,
+            entity_a,
+            entity_b,
+        )
     if intent == "identity_lookup" and _is_abang_identity_target(target_entity):
         ranked_semantic = _filter_ranked_abang_identity(ranked_semantic)
     person_entities: list[str] = []
@@ -3258,20 +3885,26 @@ def main() -> None:
     summary = summary_semantic
     edges = edges_semantic
     timeline = timeline_semantic
-    if _is_person_like_two_word_query(search_query) and has_exact_full_name_hit(ranked, search_query):
+    if (
+        _is_person_like_two_word_query(search_query)
+        and has_exact_full_name_hit(ranked, search_query)
+        and intent != "relationship_between_entities"
+    ):
         evidence_pool = primary_evidence + related_evidence
         if evidence_pool:
             summary, edges, timeline = aggregate_dashboard(evidence_pool, search_query)
     query_person_phrase = _person_phrase_from_query(search_query)
     identity_result = IdentityClusterResult(query_phrase=query_person_phrase)
-    if _is_person_like_two_word_query(search_query):
+    if _is_person_like_two_word_query(search_query) and intent != "relationship_between_entities":
         identity_result = build_person_identity_clusters(query_person_phrase, ranked)
 
-    corpus_exact_name_hit = _is_person_like_two_word_query(search_query) and corpus_has_exact_phrase(
-        store.records, query_person_phrase
+    corpus_exact_name_hit = (
+        _is_person_like_two_word_query(search_query)
+        and intent != "relationship_between_entities"
+        and corpus_has_exact_phrase(store.records, query_person_phrase)
     )
 
-    person_query = _is_person_like_two_word_query(search_query)
+    person_query = _is_person_like_two_word_query(search_query) and intent != "relationship_between_entities"
     exact_person_match = person_query and has_exact_match(search_query, primary_evidence)
     closest_person_matches = (
         get_closest_person_matches(search_query, summary.persons, limit=3)
@@ -3295,8 +3928,12 @@ def main() -> None:
         )
         else (closest_person_matches[0][0] if closest_person_matches else None)
     )
+    if intent == "relationship_between_entities":
+        selected_analysis_name = None
 
     if intent == "identity_lookup" and _is_abang_identity_target(target_entity):
+        analysis_ranked = list(ranked)
+    elif intent == "relationship_between_entities":
         analysis_ranked = list(ranked)
     else:
         analysis_ranked = _filter_ranked_for_selected_name(ranked, selected_analysis_name)
@@ -3332,7 +3969,7 @@ def main() -> None:
 
     subj_for_veh_edges = (selected_analysis_name or _person_phrase_from_query(search_query) or "").strip()
     _identity_abang_ctx = intent == "identity_lookup" and _is_abang_identity_target(target_entity)
-    if subj_for_veh_edges and not _identity_abang_ctx:
+    if subj_for_veh_edges and not _identity_abang_ctx and intent != "relationship_between_entities":
         edges = _supplement_subject_vehicle_edges(
             subj_for_veh_edges,
             summary,
@@ -3346,7 +3983,7 @@ def main() -> None:
         )
 
     walker_edge_labels: dict[tuple[str, str], str] = {}
-    if not _identity_abang_ctx:
+    if not _identity_abang_ctx and intent != "relationship_between_entities":
         edges, walker_edge_labels = merge_walker_case_edges(edges, selected_analysis_name, search_query)
         timeline = supplement_walker_timeline(timeline, selected_analysis_name, search_query)
     classified_edges = apply_relationship_classification(edges, primary_evidence + related_evidence)
@@ -3375,11 +4012,31 @@ def main() -> None:
     classified_edges = _dedupe_classified_edges_max_strength(classified_edges)
     if _identity_abang_ctx:
         classified_edges = _filter_classified_edges_abang_identity_only(classified_edges)
+    pair_rel_paths: dict[str, object] | None = None
+    if intent == "relationship_between_entities" and entity_a and entity_b:
+        pair_rel_paths = find_shared_relationship_paths(
+            entity_a,
+            entity_b,
+            classified_edges,
+            primary_evidence + related_evidence,
+        )
+        classified_edges = filter_classified_edges_for_pair_graph(classified_edges, entity_a, entity_b)
+        timeline = _filter_timeline_for_relationship_pair(
+            timeline,
+            primary_evidence + related_evidence,
+            entity_a,
+            entity_b,
+            _bridge_tokens_from_paths(pair_rel_paths),
+        )
     walker_edge_labels = {**walker_edge_labels, **resolution_graph_labels}
     non_weak_edges = [e for e in classified_edges if e[4] != "weak"]
     weak_edges = [e for e in classified_edges if e[4] == "weak"]
 
-    _op_subject = (selected_analysis_name or _person_phrase_from_query(search_query) or search_query).strip()
+    _op_subject = (
+        f"{entity_a.strip()} · {entity_b.strip()}"
+        if intent == "relationship_between_entities" and entity_a and entity_b
+        else (selected_analysis_name or _person_phrase_from_query(search_query) or search_query).strip()
+    )
     operational_tab_assessment = _derive_operational_assessment(
         primary_evidence + related_evidence,
         summary,
@@ -3420,9 +4077,13 @@ def main() -> None:
         summary_evidence_sel = chosen.chunks
         cluster_label_sel = cluster_summary_label(chosen)
 
-    st.subheader("AI Summary")
     alias_result_ui: dict[str, object] | None = None
     score_ui: dict[str, object] | None = None
+    conf_tab: dict[str, object] | None = None
+    dash_conf_label = "—"
+    dash_conf_score = 0
+    dash_conf_rationale = ""
+
     if intent == "entity_resolution":
         alias_result_ui = resolution_alias_pre or extract_alias_evidence(
             primary_evidence + related_evidence,
@@ -3430,10 +4091,8 @@ def main() -> None:
             entity_b,
         )
         score_ui = score_entity_resolution(alias_result_ui)
-        render_confidence_bar(int(score_ui["score"]), str(score_ui["level"]))
-        if DEBUG_MODE:
-            st.write("DEBUG explicit_alias_confirmed:", alias_result_ui.get("explicit_alias_confirmed"))
-            st.write("DEBUG score:", int(score_ui.get("score", 0)))
+        dash_conf_label = str(score_ui["level"])
+        dash_conf_score = int(score_ui["score"])
     elif intent == "identity_lookup" and _is_abang_identity_target(target_entity):
         alias_result_ui = resolution_alias_pre or extract_alias_evidence(
             primary_evidence + related_evidence,
@@ -3441,8 +4100,15 @@ def main() -> None:
             "Abang Tan",
         )
         score_ui = score_entity_resolution(alias_result_ui)
-        render_confidence_bar(int(score_ui["score"]), str(score_ui["level"]))
-    elif intent in {"entity_overview", "offence_summary", "vehicle_lookup", "relationship_lookup"}:
+        dash_conf_label = str(score_ui["level"])
+        dash_conf_score = int(score_ui["score"])
+    elif intent in {
+        "entity_overview",
+        "offence_summary",
+        "vehicle_lookup",
+        "relationship_lookup",
+        "relationship_between_entities",
+    }:
         fuzzy_ctx = bool(person_query and not exact_person_match and selected_analysis_name)
         conf_tab = score_evidence_confidence(
             search_query=search_query,
@@ -3453,34 +4119,236 @@ def main() -> None:
             classified_edges=classified_edges,
             fuzzy_name_context=fuzzy_ctx,
         )
-        render_confidence_bar(int(conf_tab["score"]), str(conf_tab["level"]))
-        st.caption(str(conf_tab["rationale"]))
-    st.write(
-        build_ai_summary(
-            ranked,
-            summary,
-            timeline,
-            search_query,
-            primary_evidence=primary_evidence,
-            linked_evidence=related_evidence,
-            corpus_exact_name_hit=corpus_exact_name_hit,
-            summary_evidence=summary_evidence_sel,
-            cluster_label=cluster_label_sel,
-            selected_analysis_name=selected_analysis_name,
-            intent=intent,
-            target_entity=target_entity,
-            entity_a=entity_a,
-            entity_b=entity_b,
-            alias_result=alias_result_ui,
-            score_result=score_ui,
-            link_edges_classified=classified_edges,
-        )
+        dash_conf_label = str(conf_tab["level"])
+        dash_conf_score = int(conf_tab["score"])
+        dash_conf_rationale = str(conf_tab["rationale"])
+
+    walker_ctx = intent != "relationship_between_entities" and should_activate_walker_scaffold(
+        search_query,
+        selected_analysis_name,
     )
+
+    st.markdown(
+        '<h2 style="margin:0.35rem 0 0.75rem 0;font-size:1.28rem;font-weight:700;color:#f0f9ff;letter-spacing:0.02em;">Mission board</h2>',
+        unsafe_allow_html=True,
+    )
+    if role != "intel":
+        st.caption(f"Intent `{intent}` · focus **{target_entity}**")
+
+    cw1, cw2 = st.columns([1.35, 3])
+    with cw1:
+        show_weak = st.checkbox(
+            "Include weak co-occurrence links",
+            value=False,
+            key="dash_show_weak",
+        )
+    with cw2:
+        st.caption("Weak edges broaden the graph; confirm in source text before dissemination.")
+
+    graph_edges, use_person_centric, anchor_person = _dashboard_prepare_graph_edges(
+        intent=intent,
+        entity_a=entity_a,
+        entity_b=entity_b,
+        search_query=search_query,
+        selected_analysis_name=selected_analysis_name,
+        ranked=ranked,
+        primary_evidence=primary_evidence,
+        related_evidence=related_evidence,
+        classified_edges=classified_edges,
+        non_weak_edges=non_weak_edges,
+        weak_edges=weak_edges,
+        walker_ctx=walker_ctx,
+        _identity_abang_ctx=_identity_abang_ctx,
+        show_weak=show_weak,
+    )
+    gfig = None
+    gnote = ""
+    if classified_edges:
+        gfig, gnote = build_entity_link_graph_figure(
+            ranked,
+            graph_edges,
+            search_query,
+            person_centric=use_person_centric,
+            anchor_person=anchor_person,
+            edge_semantic_labels=walker_edge_labels if walker_edge_labels else None,
+        )
+    strongest_l, most_conn_l = _graph_connection_stats(graph_edges)
+
+    summary_md = build_ai_summary(
+        ranked,
+        summary,
+        timeline,
+        search_query,
+        primary_evidence=primary_evidence,
+        linked_evidence=related_evidence,
+        corpus_exact_name_hit=corpus_exact_name_hit,
+        summary_evidence=summary_evidence_sel,
+        cluster_label=cluster_label_sel,
+        selected_analysis_name=selected_analysis_name,
+        intent=intent,
+        target_entity=target_entity,
+        entity_a=entity_a,
+        entity_b=entity_b,
+        alias_result=alias_result_ui,
+        score_result=score_ui,
+        link_edges_classified=classified_edges,
+    )
+
+    unique_entity_nodes: set[str] = set()
+    for a, b, *_ge in classified_edges:
+        unique_entity_nodes.add(a)
+        unique_entity_nodes.add(b)
+    entity_metric = (
+        len(unique_entity_nodes)
+        if unique_entity_nodes
+        else (len(summary.persons) + len(summary.vehicles) + len(summary.phones))
+    )
+    n_sources_dash = len({r.source_file for r, _ in ranked if r.source_file})
+
+    met1, met2, met3, met4 = st.columns(4)
+    with met1:
+        st.metric("Entity signals", int(entity_metric))
+    with met2:
+        st.metric("Active relationships", len(graph_edges))
+    with met3:
+        st.metric("Source files", int(n_sources_dash))
+    with met4:
+        st.metric(
+            "Assessment",
+            dash_conf_label,
+            help=dash_conf_rationale or "Evidence / resolution scoring for this slice.",
+        )
+
+    row_a, row_b, row_c = st.columns([1.45, 1.0, 0.95], gap="medium")
+
+    with row_a:
+        st.markdown('<div class="intelink-card">', unsafe_allow_html=True)
+        st.markdown("###### Link graph")
+        if gfig is not None:
+            st.plotly_chart(gfig, use_container_width=True)
+        elif not classified_edges:
+            st.caption("No co-occurrence edges in this retrieval slice.")
+        else:
+            st.warning("Graph did not render.")
+        if gnote:
+            st.caption(gnote)
+        st.markdown(
+            '<div class="intel-legend-row">'
+            '<span><span class="intel-legend-swatch" style="background:#22d3ee;box-shadow:0 0 8px #22d3ee88"></span>Person</span>'
+            '<span><span class="intel-legend-swatch" style="background:#34d399"></span>Vehicle</span>'
+            '<span><span class="intel-legend-swatch" style="background:#fb923c"></span>Phone</span>'
+            '<span><span class="intel-legend-swatch" style="background:#a78bfa"></span>Company</span>'
+            '<span><span class="intel-legend-swatch" style="background:#64748b"></span>Unknown associate</span>'
+            "</div>",
+            unsafe_allow_html=True,
+        )
+        c_ma, c_mb = st.columns(2)
+        with c_ma:
+            st.caption("Strongest link")
+            st.markdown(
+                f'<div style="font-size:0.82rem;color:#cbd5e1;">{html.escape(strongest_l, quote=True)}</div>',
+                unsafe_allow_html=True,
+            )
+        with c_mb:
+            st.caption("Most connected")
+            st.markdown(
+                f'<div style="font-size:0.82rem;color:#cbd5e1;">{html.escape(most_conn_l, quote=True)}</div>',
+                unsafe_allow_html=True,
+            )
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    with row_b:
+        st.markdown('<div class="intelink-card">', unsafe_allow_html=True)
+        st.markdown("###### AI assessment")
+        badge_risk = str(operational_tab_assessment.get("risk_tier") or "Low")
+        badge_cls = "intel-badge" if badge_risk != "High" else "intel-badge-amber"
+        st.markdown(
+            f'<div style="margin-bottom:10px;">'
+            f'<span class="{badge_cls}">Evidence {dash_conf_label}</span>'
+            f'<span class="intel-badge-violet">Ops relevance {badge_risk}</span>'
+            "</div>",
+            unsafe_allow_html=True,
+        )
+        if DEBUG_MODE and alias_result_ui is not None:
+            st.write("DEBUG explicit_alias_confirmed:", alias_result_ui.get("explicit_alias_confirmed"))
+            st.write("DEBUG score:", dash_conf_score)
+        st.markdown(_intelink_summary_card_body(summary_md, 720))
+        key_ids: list[str] = []
+        for p, _c in summary.phones.most_common(3):
+            key_ids.append(f"Phone · `{p}`")
+        for v, _c in summary.vehicles.most_common(2):
+            key_ids.append(f"Vehicle · `{v}`")
+        for pers, _c in summary.persons.most_common(3):
+            key_ids.append(f"Person · **{pers}**")
+        if key_ids:
+            st.markdown("**Key identifiers**")
+            for line in key_ids[:8]:
+                st.markdown(f"- {line}", unsafe_allow_html=True)
+        with st.expander("Full intelligence brief"):
+            st.markdown(summary_md)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    with row_c:
+        st.markdown('<div class="intelink-card intel-scroll">', unsafe_allow_html=True)
+        st.markdown("###### Timeline")
+        st.markdown(_render_timeline_vertical_html(timeline), unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    row_d, row_e = st.columns([1.1, 1.0], gap="medium")
+    with row_d:
+        st.markdown('<div class="intelink-card intel-scroll">', unsafe_allow_html=True)
+        st.markdown("###### Top sources")
+        for fn, stype, sc, title in _intelink_top_sources_rows(ranked, limit=8):
+            exp_title = f"📄 `{fn}` · {stype} · score {sc:.2f}"
+            with st.expander(exp_title):
+                st.caption(title or "—")
+                for r2, _s2 in ranked:
+                    if (r2.source_file or r2.doc_id) == fn:
+                        st.markdown(highlight_query(r2.text[:4500], search_query))
+                        st.caption(f"`{r2.chunk_id}`")
+                        break
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    with row_e:
+        st.markdown('<div class="intelink-card">', unsafe_allow_html=True)
+        st.markdown("###### Operational picture")
+        rn = str(operational_tab_assessment.get("risk_narrative") or "")
+        st.caption(rn[:560] + ("…" if len(rn) > 560 else ""))
+        inds = list(operational_tab_assessment.get("indicators") or [])[:4]
+        if inds:
+            st.markdown("**Indicators**")
+            for x in inds:
+                st.markdown(f"- {x}")
+        esc = list(operational_tab_assessment.get("escalations") or [])[:3]
+        if esc:
+            st.markdown("**Escalation notes**")
+            for x in esc:
+                st.markdown(f"- {x}")
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    ph_cols = st.columns(5)
+    ph_labels = ("Live alerts", "Watchlist", "Geo map", "Risk score", "Analyst notes")
+    for i, col in enumerate(ph_cols):
+        with col:
+            st.markdown(
+                f'<div class="intelink-card" style="opacity:0.78;padding:0.65rem 0.75rem;">'
+                f'<div style="font-size:0.68rem;text-transform:uppercase;letter-spacing:0.12em;color:#64748b;">{ph_labels[i]}</div>'
+                f'<div style="font-size:0.78rem;color:#475569;margin-top:4px;">No feed connected</div></div>',
+                unsafe_allow_html=True,
+            )
+
+    if conf_tab is not None:
+        render_confidence_bar(dash_conf_score, dash_conf_label)
+        if dash_conf_rationale:
+            st.caption(dash_conf_rationale)
+    elif score_ui is not None:
+        render_confidence_bar(dash_conf_score, dash_conf_label)
+
     if (
         person_query
         and not exact_person_match
         and selected_analysis_name
-        and intent != "identity_lookup"
+        and intent not in ("identity_lookup", "relationship_between_entities")
     ):
         st.warning(
             f"No exact match for '{search_query}'. Showing closest-match context for '{selected_analysis_name}' only."
@@ -3490,7 +4358,7 @@ def main() -> None:
         )
     q_tokens = [t for t in search_query.strip().lower().split() if len(t) > 1]
     if (
-        intent != "identity_lookup"
+        intent not in ("identity_lookup", "relationship_between_entities")
         and len(q_tokens) >= 2
         and not has_exact_match(search_query, primary_evidence)
     ):
@@ -3505,26 +4373,6 @@ def main() -> None:
                 "ranked results may still include partial mentions or similarly named people."
             )
 
-    st.markdown(
-        """
-<style>
-div[data-testid="stTabs"] [data-baseweb="tab"] {
-    color: #94a3b8 !important;
-    font-weight: 400 !important;
-    font-size: 0.95rem !important;
-    border-bottom: 2px solid transparent !important;
-    padding-bottom: 0.35rem !important;
-}
-div[data-testid="stTabs"] [data-baseweb="tab"][aria-selected="true"] {
-    color: #0f172a !important;
-    font-weight: 700 !important;
-    font-size: 1rem !important;
-    border-bottom: 3px solid #ff4b4b !important;
-}
-</style>
-""",
-        unsafe_allow_html=True,
-    )
     res_tab, id_tab, ent_tab, rel_tab, time_tab = st.tabs(
         ["Evidence", "Identity Clusters", "Entity Profile", "Link Analysis", "Activity Timeline"]
     )
@@ -3548,6 +4396,11 @@ div[data-testid="stTabs"] [data-baseweb="tab"][aria-selected="true"] {
                 st.caption(f"`{r.source_file}` · `{r.chunk_id}`")
 
     with id_tab:
+        if intent == "relationship_between_entities":
+            st.info(
+                "Two-entity relationship question: identity clustering is disabled. "
+                "Evidence and graphs are scoped to the two named subjects and bridging identifiers only."
+            )
         if intent == "entity_resolution":
             if resolution_alias_pre:
                 score_er_tab = score_entity_resolution(resolution_alias_pre)
@@ -3582,13 +4435,16 @@ div[data-testid="stTabs"] [data-baseweb="tab"][aria-selected="true"] {
                 "case ID, company, or address signals in retrieved text. Same name without shared signals stays unlinked."
             )
         if (
-            intent not in ("entity_resolution", "identity_lookup")
+            intent not in ("entity_resolution", "identity_lookup", "relationship_between_entities")
             and not _is_person_like_two_word_query(search_query)
         ):
             st.info("Identity clustering runs for full-name queries (two name tokens, e.g. **John Tan**).")
-        elif intent not in ("entity_resolution", "identity_lookup") and not filtered_identity_clusters:
+        elif (
+            intent not in ("entity_resolution", "identity_lookup", "relationship_between_entities")
+            and not filtered_identity_clusters
+        ):
             st.write("No same-name mentions found in retrieved snippets for this query phrase.")
-        elif intent not in ("entity_resolution", "identity_lookup"):
+        elif intent not in ("entity_resolution", "identity_lookup", "relationship_between_entities"):
             st.markdown(f"### Possible identities for **{identity_result.query_phrase}**")
             for cl in filtered_identity_clusters:
                 title = "Unlinked mention" if cl.is_unlinked else f"Identity Cluster {cl.display_index}"
@@ -3615,41 +4471,84 @@ div[data-testid="stTabs"] [data-baseweb="tab"][aria-selected="true"] {
                     st.caption(sm.snippet)
 
     with ent_tab:
-        st.markdown(
-            build_entity_profile_analyst_summary(
-                summary,
-                selected_analysis_name or search_query,
-                alias_map,
-                operational_assessment=operational_tab_assessment,
-                evidence_pool=primary_evidence + related_evidence,
+        if intent == "relationship_between_entities" and pair_rel_paths is not None:
+            st.markdown(
+                build_pair_shared_entity_profile_markdown(pair_rel_paths, entity_a, entity_b)
             )
-        )
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            st.metric("Distinct persons", len(summary.persons))
-            st.dataframe(
-                pd.DataFrame(summary.persons.most_common(25), columns=["Person", "Mentions"]),
-                use_container_width=True,
-                height=360,
+            c1, c2, c3 = st.columns(3)
+            assoc = list(pair_rel_paths.get("shared_associates") or [])
+            with c1:
+                st.metric("Named subjects", 2)
+                st.dataframe(
+                    pd.DataFrame(
+                        [(entity_a, "—"), (entity_b, "—")],
+                        columns=["Person", "In slice"],
+                    ),
+                    use_container_width=True,
+                    height=200,
+                )
+                if assoc:
+                    st.caption("Third-party associates on bridging edges")
+                    st.dataframe(
+                        pd.DataFrame([(a, "bridge") for a in assoc[:20]], columns=["Person", "Role"]),
+                        use_container_width=True,
+                        height=200,
+                    )
+            with c2:
+                vehs = list(pair_rel_paths.get("shared_vehicles") or [])
+                st.metric("Shared vehicles / plates", len(vehs))
+                st.dataframe(
+                    pd.DataFrame([(v, "shared") for v in vehs[:25]], columns=["Vehicle / plate", "Context"]),
+                    use_container_width=True,
+                    height=360,
+                )
+            with c3:
+                phs = list(pair_rel_paths.get("shared_phones") or [])
+                st.metric("Shared phones", len(phs))
+                st.dataframe(
+                    pd.DataFrame([(p, "shared") for p in phs[:25]], columns=["Phone (normalized)", "Context"]),
+                    use_container_width=True,
+                    height=360,
+                )
+        else:
+            st.markdown(
+                build_entity_profile_analyst_summary(
+                    summary,
+                    selected_analysis_name or search_query,
+                    alias_map,
+                    operational_assessment=operational_tab_assessment,
+                    evidence_pool=primary_evidence + related_evidence,
+                )
             )
-        with c2:
-            st.metric("Vehicle / plate signals", len(summary.vehicles))
-            st.dataframe(
-                pd.DataFrame(summary.vehicles.most_common(25), columns=["Vehicle / plate", "Mentions"]),
-                use_container_width=True,
-                height=360,
-            )
-        with c3:
-            st.metric("Phone numbers", len(summary.phones))
-            st.dataframe(
-                pd.DataFrame(summary.phones.most_common(25), columns=["Phone (normalized)", "Mentions"]),
-                use_container_width=True,
-                height=360,
-            )
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                st.metric("Distinct persons", len(summary.persons))
+                st.dataframe(
+                    pd.DataFrame(summary.persons.most_common(25), columns=["Person", "Mentions"]),
+                    use_container_width=True,
+                    height=360,
+                )
+            with c2:
+                st.metric("Vehicle / plate signals", len(summary.vehicles))
+                st.dataframe(
+                    pd.DataFrame(summary.vehicles.most_common(25), columns=["Vehicle / plate", "Mentions"]),
+                    use_container_width=True,
+                    height=360,
+                )
+            with c3:
+                st.metric("Phone numbers", len(summary.phones))
+                st.dataframe(
+                    pd.DataFrame(summary.phones.most_common(25), columns=["Phone (normalized)", "Mentions"]),
+                    use_container_width=True,
+                    height=360,
+                )
 
     with rel_tab:
-        walker_ctx = should_activate_walker_scaffold(search_query, selected_analysis_name)
-        _link_subject = (selected_analysis_name or _person_phrase_from_query(search_query) or search_query).strip()
+        _link_subject = (
+            f"{entity_a.strip()} · {entity_b.strip()}"
+            if intent == "relationship_between_entities" and entity_a and entity_b
+            else (selected_analysis_name or _person_phrase_from_query(search_query) or search_query).strip()
+        )
         st.markdown(
             build_link_analysis_analyst_summary(
                 _link_subject,
@@ -3658,8 +4557,12 @@ div[data-testid="stTabs"] [data-baseweb="tab"][aria-selected="true"] {
                 operational_assessment=operational_tab_assessment,
                 intent=intent,
                 alias_result=resolution_alias_pre,
-                entity_a=entity_a if intent == "entity_resolution" else ("Abang" if _identity_abang_ctx else ""),
-                entity_b=entity_b if intent == "entity_resolution" else ("Abang Tan" if _identity_abang_ctx else ""),
+                entity_a=entity_a
+                if intent in ("entity_resolution", "relationship_between_entities")
+                else ("Abang" if _identity_abang_ctx else ""),
+                entity_b=entity_b
+                if intent in ("entity_resolution", "relationship_between_entities")
+                else ("Abang Tan" if _identity_abang_ctx else ""),
             )
         )
         if walker_ctx and role == "admin":
@@ -3667,66 +4570,20 @@ div[data-testid="stTabs"] [data-baseweb="tab"][aria-selected="true"] {
             st.markdown(direct_context_markdown())
             st.markdown(indirect_context_markdown())
             st.caption(
-                "Graph below: **solid** lines = direct Case #2 links; **dashed** lines = indirect Case #3 context. "
+                "Graph on Mission board: **solid** lines = direct Case #2 links; **dashed** lines = indirect Case #3 context. "
                 "Rahman's group is nested under a group hub (second-hop context)."
             )
         elif walker_ctx:
             st.caption(
                 "Case #2 / #3 scaffolding applies to this query; switch to the admin account to read the full case narrative blocks."
             )
-        st.subheader("Co-occurrence in retrieved chunks")
-        show_weak = st.checkbox("Show weak co-occurrence links", value=False)
+        st.subheader("Relationship edges (detail)")
+        st.caption(
+            "Use **Include weak co-occurrence links** on the Mission board to change the active edge slice; this table updates on rerun."
+        )
         if not classified_edges:
             st.write("No edges found for this result set.")
         else:
-            canonical_res = None
-            if intent == "entity_resolution" or _identity_abang_ctx:
-                canonical_res = _infer_canonical_identity_from_evidence(primary_evidence + related_evidence)
-            use_person_centric = walker_ctx or (
-                bool(canonical_res) and intent in ("entity_resolution", "identity_lookup")
-            ) or (
-                _is_person_like_two_word_query(search_query) and has_exact_full_name_hit(ranked, search_query)
-            )
-            if walker_ctx:
-                anchor_person = walker_graph_anchor_person(selected_analysis_name)
-            elif intent == "entity_resolution" and canonical_res:
-                anchor_person = canonical_res
-            elif _identity_abang_ctx and canonical_res:
-                anchor_person = canonical_res
-            elif use_person_centric:
-                anchor_person = _person_phrase_from_query(search_query)
-            else:
-                anchor_person = ""
-            if (
-                use_person_centric
-                and anchor_person
-                and not walker_ctx
-                and intent != "entity_resolution"
-                and not _identity_abang_ctx
-            ):
-                graph_edges = build_subject_relationship_subgraph(
-                    classified_edges,
-                    anchor_person,
-                    show_weak=show_weak,
-                )
-            else:
-                graph_edges = list(non_weak_edges)
-                if show_weak:
-                    graph_edges = _dedupe_classified_edges_max_strength(graph_edges + list(weak_edges))
-            gfig, gnote = build_entity_link_graph_figure(
-                ranked,
-                graph_edges,
-                search_query,
-                person_centric=use_person_centric,
-                anchor_person=anchor_person,
-                edge_semantic_labels=walker_edge_labels if walker_edge_labels else None,
-            )
-            if gfig is not None:
-                st.plotly_chart(gfig, use_container_width=True)
-                if gnote:
-                    st.caption(gnote)
-            else:
-                st.warning("Graph failed to render but edges exist")
             df_e = pd.DataFrame(graph_edges, columns=["Entity A", "Entity B", "Strength", "Relationship type", "Plot style"])
             parsed_conf: list[str] = []
             parsed_basis: list[str] = []

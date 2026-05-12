@@ -56,7 +56,7 @@ def _node_kind(node_id: str) -> str:
     if _is_unknown_associate_node(node_id):
         return "unknown_associate"
     prefix = node_id.split(":", 1)[0].lower()
-    if prefix in ("person", "vehicle", "phone", "case", "source", "pseudo"):
+    if prefix in ("person", "vehicle", "phone", "case", "source", "pseudo", "company"):
         return prefix
     return "other"
 
@@ -119,6 +119,7 @@ def _marker_symbol(kind: str) -> str:
         "unknown_associate": "circle",
         "vehicle": "square",
         "phone": "diamond",
+        "company": "diamond",
         "case": "star",
         "source": "triangle-up",
         "other": "circle-open",
@@ -126,16 +127,18 @@ def _marker_symbol(kind: str) -> str:
 
 
 def _marker_color(kind: str) -> str:
+    """SOC-style neon mapping for dark graph canvas."""
     return {
-        "person": "#2563eb",
-        "pseudo": "#1d4ed8",
-        "unknown_associate": "#b8c9dc",
-        "vehicle": "#059669",
-        "phone": "#d97706",
-        "case": "#64748b",
-        "source": "#7c3aed",
-        "other": "#94a3b8",
-    }.get(kind, "#94a3b8")
+        "person": "#22d3ee",
+        "pseudo": "#38bdf8",
+        "unknown_associate": "#94a3b8",
+        "vehicle": "#4ade80",
+        "phone": "#fb923c",
+        "company": "#c084fc",
+        "case": "#2dd4bf",
+        "source": "#818cf8",
+        "other": "#64748b",
+    }.get(kind, "#64748b")
 
 
 def _first_query_segment(query: str) -> str:
@@ -306,7 +309,7 @@ def _prioritize_edges_for_anchor(
 
 
 def _type_group_rank(kind: str) -> int:
-    order = ("person", "pseudo", "unknown_associate", "vehicle", "phone", "case", "source", "other")
+    order = ("person", "pseudo", "unknown_associate", "vehicle", "phone", "company", "case", "source", "other")
     try:
         return order.index(kind)
     except ValueError:
@@ -531,21 +534,29 @@ def build_entity_link_graph_figure(
 
         fig = go.Figure()
         edge_trace_count = 0
-        for a, b, strength, _lbl, link_type in reduced_edges:
+        for a, b, strength, lbl, link_type in reduced_edges:
             if a not in pos or b not in pos:
                 continue
             x0, y0 = pos[a]
             x1, y1 = pos[b]
             dash = "solid" if link_type == "direct" else "dash"
             norm = float(strength) / max_strength if max_strength > 0 else 0.0
-            width = 2.0 + norm * 6.5
+            width = 3.5 + norm * 8.0
+            if link_type == "direct":
+                ec = "rgba(34, 211, 238, 0.95)"
+            else:
+                ec = "rgba(148, 163, 184, 0.55)"
+            rel_bits = str(lbl).split("|")
+            rel_short = rel_bits[0].strip() if rel_bits else ""
+            conf_bit = rel_bits[1].strip() if len(rel_bits) > 1 else ""
+            hover_edge = f"{a} ↔ {b}<br>{rel_short}<br>{conf_bit}<extra></extra>"
             fig.add_trace(
                 go.Scatter(
                     x=[x0, x1],
                     y=[y0, y1],
                     mode="lines",
-                    line=dict(color="#0f172a", width=width, dash=dash),
-                    hoverinfo="skip",
+                    line=dict(color=ec, width=width, dash=dash),
+                    hovertemplate=hover_edge,
                     showlegend=False,
                 )
             )
@@ -569,16 +580,16 @@ def build_entity_link_graph_figure(
                 y=node_y,
                 mode="markers+text",
                 marker=dict(
-                    size=20,
+                    size=26,
                     color=[color_map[nid] for nid in node_list],
-                    line=dict(width=1, color="#0f172a"),
+                    line=dict(width=2, color="rgba(226,232,240,0.35)"),
                     symbol=[_marker_symbol(_node_kind(nid)) for nid in node_list],
                 ),
                 text=[label_map[nid] for nid in node_list],
                 textposition=text_positions,
-                textfont=dict(size=10, color="#0f172a"),
-                hoverinfo="text",
-                hovertext=node_list,
+                textfont=dict(size=11, color="#e2e8f0"),
+                hovertemplate="%{customdata}<extra></extra>",
+                customdata=node_list,
                 showlegend=False,
             )
         )
@@ -592,16 +603,16 @@ def build_entity_link_graph_figure(
                     y=[pos[nid][1] for nid in node_list],
                     mode="markers+text",
                     marker=dict(
-                        size=20,
+                        size=26,
                         color=[color_map[nid] for nid in node_list],
-                        line=dict(width=1, color="#0f172a"),
+                        line=dict(width=2, color="rgba(226,232,240,0.35)"),
                         symbol=[_marker_symbol(_node_kind(nid)) for nid in node_list],
                     ),
                     text=[label_map[nid] for nid in node_list],
                     textposition="top center",
-                    textfont=dict(size=11, color="#0f172a"),
-                    hoverinfo="text",
-                    hovertext=node_list,
+                    textfont=dict(size=12, color="#e2e8f0"),
+                    hovertemplate="%{customdata}<extra></extra>",
+                    customdata=node_list,
                     showlegend=False,
                 )
             )
@@ -640,7 +651,7 @@ def build_entity_link_graph_figure(
                     "y": oy,
                     "text": edge_text,
                     "showarrow": False,
-                    "font": {"size": 10, "color": "#334155"},
+                    "font": {"size": 10, "color": "#94a3b8"},
                     "textangle": textangle,
                 }
             )
@@ -650,12 +661,7 @@ def build_entity_link_graph_figure(
                 x=[None],
                 y=[None],
                 mode="markers",
-                marker=dict(
-                    size=11,
-                    color="#b8c9dc",
-                    symbol="circle",
-                    line=dict(width=2, color="#64748b"),
-                ),
+                marker=dict(size=12, color="#94a3b8", symbol="circle", line=dict(width=2, color="#cbd5e1")),
                 name="Unknown associate",
                 showlegend=True,
                 hoverinfo="skip",
@@ -666,7 +672,7 @@ def build_entity_link_graph_figure(
                 x=[None],
                 y=[None],
                 mode="markers",
-                marker=dict(size=11, color="#2563eb", symbol="circle", line=dict(width=1, color="#0f172a")),
+                marker=dict(size=12, color="#22d3ee", symbol="circle", line=dict(width=1, color="#67e8f9")),
                 name="Person",
                 showlegend=True,
                 hoverinfo="skip",
@@ -677,7 +683,7 @@ def build_entity_link_graph_figure(
                 x=[None],
                 y=[None],
                 mode="markers",
-                marker=dict(size=11, color="#059669", symbol="square", line=dict(width=1, color="#0f172a")),
+                marker=dict(size=12, color="#4ade80", symbol="square", line=dict(width=1, color="#bbf7d0")),
                 name="Vehicle / plate",
                 showlegend=True,
                 hoverinfo="skip",
@@ -688,8 +694,19 @@ def build_entity_link_graph_figure(
                 x=[None],
                 y=[None],
                 mode="markers",
-                marker=dict(size=11, color="#d97706", symbol="diamond", line=dict(width=1, color="#0f172a")),
+                marker=dict(size=12, color="#fb923c", symbol="diamond", line=dict(width=1, color="#fed7aa")),
                 name="Phone",
+                showlegend=True,
+                hoverinfo="skip",
+            )
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=[None],
+                y=[None],
+                mode="markers",
+                marker=dict(size=12, color="#c084fc", symbol="diamond", line=dict(width=1, color="#e9d5ff")),
+                name="Company",
                 showlegend=True,
                 hoverinfo="skip",
             )
@@ -699,7 +716,7 @@ def build_entity_link_graph_figure(
                 x=[None, None],
                 y=[None, None],
                 mode="lines",
-                line=dict(color="#0f172a", width=5),
+                line=dict(color="rgba(148,163,184,0.5)", width=5),
                 name="Thicker line = stronger relationship",
                 showlegend=True,
                 hoverinfo="skip",
@@ -710,7 +727,7 @@ def build_entity_link_graph_figure(
                 x=[None, None],
                 y=[None, None],
                 mode="lines",
-                line=dict(color="#0f172a", width=3.5, dash="solid"),
+                line=dict(color="rgba(34,211,238,0.9)", width=4, dash="solid"),
                 name="Direct relationship",
                 showlegend=True,
                 hoverinfo="skip",
@@ -721,7 +738,7 @@ def build_entity_link_graph_figure(
                 x=[None, None],
                 y=[None, None],
                 mode="lines",
-                line=dict(color="#0f172a", width=3.5, dash="dash"),
+                line=dict(color="rgba(148,163,184,0.45)", width=3.5, dash="dash"),
                 name="Indirect relationship",
                 showlegend=True,
                 hoverinfo="skip",
@@ -729,21 +746,23 @@ def build_entity_link_graph_figure(
         )
 
         fig.update_layout(
-            title=dict(text="Relationship graph (current retrieval only)", font=dict(size=14, color="#0f172a")),
-            xaxis=dict(range=[-2, 2], visible=False),
-            yaxis=dict(range=[-2, 2], visible=False),
+            title=dict(text="Relationship graph (current retrieval only)", font=dict(size=15, color="#e2e8f0")),
+            xaxis=dict(range=[-2, 2], visible=False, gridcolor="rgba(30,41,59,0.4)"),
+            yaxis=dict(range=[-2, 2], visible=False, gridcolor="rgba(30,41,59,0.4)"),
             showlegend=True,
             legend=dict(
                 orientation="h",
-                yanchor="top",
+                yanchor="bottom",
                 y=1.02,
                 xanchor="left",
                 x=0.0,
-                bgcolor="rgba(248,250,252,0.92)",
+                bgcolor="rgba(15,23,42,0.75)",
+                font=dict(color="#e2e8f0", size=11),
             ),
-            plot_bgcolor="#ffffff",
-            paper_bgcolor="#f8fafc",
-            margin=dict(l=20, r=20, t=48, b=20),
+            plot_bgcolor="#0f1629",
+            paper_bgcolor="#0a0e1a",
+            font=dict(color="#e2e8f0"),
+            margin=dict(l=20, r=20, t=56, b=20),
             height=520,
             annotations=ann,
         )
