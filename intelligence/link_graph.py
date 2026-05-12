@@ -14,7 +14,7 @@ from intelligence.entities import normalize_phone_number
 from intelligence.index_store import ChunkRecord
 
 
-GRAPH_TOP_EDGES = 20
+GRAPH_TOP_EDGES = 32
 MAX_TOTAL_NODES = 16
 MAX_CASE_NODES = 4
 EDGE_LABEL_MAX = 6
@@ -43,9 +43,18 @@ def _entity_key(h: Any) -> str | None:
     return f"{h.label}:{t}"
 
 
+UNKNOWN_ASSOCIATE_LABEL = "Unknown associate"
+
+
+def _is_unknown_associate_node(node_id: str) -> bool:
+    return (node_id or "").lower() == "person:unknown male / second party"
+
+
 def _node_kind(node_id: str) -> str:
     if ":" not in node_id:
         return "other"
+    if _is_unknown_associate_node(node_id):
+        return "unknown_associate"
     prefix = node_id.split(":", 1)[0].lower()
     if prefix in ("person", "vehicle", "phone", "case", "source", "pseudo"):
         return prefix
@@ -65,6 +74,12 @@ def _short_label(node_id: str) -> str:
     if len(rest) > 14:
         return rest[:12] + "…"
     return rest
+
+
+def _node_display_label(node_id: str, plate_to_model: dict[str, str]) -> str:
+    if _is_unknown_associate_node(node_id):
+        return UNKNOWN_ASSOCIATE_LABEL
+    return _vehicle_display_label(node_id, plate_to_model)
 
 
 def _vehicle_display_label(node_id: str, plate_to_model: dict[str, str]) -> str:
@@ -101,6 +116,7 @@ def _marker_symbol(kind: str) -> str:
     return {
         "person": "circle",
         "pseudo": "circle",
+        "unknown_associate": "circle",
         "vehicle": "square",
         "phone": "diamond",
         "case": "star",
@@ -113,6 +129,7 @@ def _marker_color(kind: str) -> str:
     return {
         "person": "#2563eb",
         "pseudo": "#1d4ed8",
+        "unknown_associate": "#b8c9dc",
         "vehicle": "#059669",
         "phone": "#d97706",
         "case": "#64748b",
@@ -274,8 +291,22 @@ def _collapse_vehicle_model_nodes(
     return remapped, plate_to_model, suppressed_models
 
 
+def _prioritize_edges_for_anchor(
+    edges: list[tuple[str, str, float, str, str]],
+    anchor_id: str | None,
+) -> list[tuple[str, str, float, str, str]]:
+    if not edges:
+        return edges
+    if not anchor_id:
+        return sorted(edges, key=lambda e: -float(e[2]))
+    return sorted(
+        edges,
+        key=lambda e: (-(e[0] == anchor_id or e[1] == anchor_id), -float(e[2]), e[0], e[1]),
+    )
+
+
 def _type_group_rank(kind: str) -> int:
-    order = ("person", "pseudo", "vehicle", "phone", "case", "source", "other")
+    order = ("person", "pseudo", "unknown_associate", "vehicle", "phone", "case", "source", "other")
     try:
         return order.index(kind)
     except ValueError:
@@ -460,7 +491,13 @@ def build_entity_link_graph_figure(
             canonical_edges.append((ca, cb, strength, lbl, link_type))
         canonical_edges, plate_to_model, _suppressed_models = _collapse_vehicle_model_nodes(canonical_edges)
         canonical_edges = _dedupe_edges_keep_max_strength(canonical_edges)
-        reduced_edges = sorted(canonical_edges, key=lambda e: -float(e[2]))[:GRAPH_TOP_EDGES]
+        pre_nodes: set[str] = {a for a, _, _, _, _ in canonical_edges} | {b for _, b, _, _, _ in canonical_edges}
+        anchor_for_sort: str | None = None
+        if person_centric:
+            pref = anchor_person.strip() or _first_query_segment(query)
+            if pref:
+                anchor_for_sort = _find_person_node_case_insensitive(pre_nodes, pref)
+        reduced_edges = _prioritize_edges_for_anchor(canonical_edges, anchor_for_sort)[:GRAPH_TOP_EDGES]
         plot_semantic_labels: dict[tuple[str, str], str] = {}
         if edge_semantic_labels:
             for a, b, *_rest in reduced_edges:
@@ -477,6 +514,8 @@ def build_entity_link_graph_figure(
             preferred_name = anchor_person.strip() or _first_query_segment(query)
             if preferred_name:
                 anchor_id = _find_person_node_case_insensitive(set(node_list), preferred_name)
+        if anchor_id is None and anchor_for_sort and anchor_for_sort in node_list:
+            anchor_id = anchor_for_sort
         if anchor_id is None:
             anchor_id = _pick_anchor_node(set(node_list), reduced_edges, None)
         if anchor_id is None or anchor_id not in node_list:
@@ -485,7 +524,7 @@ def build_entity_link_graph_figure(
         pos = _radial_grouped_ring_layout(node_list, reduced_edges, anchor_id)
         pos = _recenter_positions(pos, anchor_id)
         pos = _sanitize_and_scale_positions(pos)
-        label_map = {nid: _vehicle_display_label(nid, plate_to_model) for nid in node_list}
+        label_map = {nid: _node_display_label(nid, plate_to_model) for nid in node_list}
         color_map = {nid: _marker_color(_node_kind(nid)) for nid in node_list}
 
         max_strength = max((float(e[2]) for e in reduced_edges), default=1.0)
@@ -611,6 +650,22 @@ def build_entity_link_graph_figure(
                 x=[None],
                 y=[None],
                 mode="markers",
+                marker=dict(
+                    size=11,
+                    color="#b8c9dc",
+                    symbol="circle",
+                    line=dict(width=2, color="#64748b"),
+                ),
+                name="Unknown associate",
+                showlegend=True,
+                hoverinfo="skip",
+            )
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=[None],
+                y=[None],
+                mode="markers",
                 marker=dict(size=11, color="#2563eb", symbol="circle", line=dict(width=1, color="#0f172a")),
                 name="Person",
                 showlegend=True,
@@ -656,7 +711,7 @@ def build_entity_link_graph_figure(
                 y=[None, None],
                 mode="lines",
                 line=dict(color="#0f172a", width=3.5, dash="solid"),
-                name="Solid = direct",
+                name="Direct relationship",
                 showlegend=True,
                 hoverinfo="skip",
             )
@@ -667,7 +722,7 @@ def build_entity_link_graph_figure(
                 y=[None, None],
                 mode="lines",
                 line=dict(color="#0f172a", width=3.5, dash="dash"),
-                name="Dashed = indirect",
+                name="Indirect relationship",
                 showlegend=True,
                 hoverinfo="skip",
             )

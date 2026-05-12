@@ -3,12 +3,13 @@ from __future__ import annotations
 import os
 import re
 import shutil
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 from datetime import datetime
 from difflib import SequenceMatcher
 from pathlib import Path
 
 import pandas as pd
+from pandas.io.formats.style import Styler
 import plotly.express as px
 import streamlit as st
 from dotenv import load_dotenv
@@ -497,6 +498,164 @@ def _filter_person_centric_graph_edges(
     return anchor_edges + [e for e in filtered if e not in anchor_edges]
 
 
+_ALWAYS_RETAINED_WEAK_REL_TYPES = frozenset(
+    {
+        "VEHICLE_OBSERVED_WITH",
+        "VEHICLE_ASSOCIATED_VIA_PHONE",
+        "PHONE_ON_FILE",
+        "PHONE_ASSOCIATED_WITH",
+    }
+)
+
+
+def _classified_edge_rel_type(edge: tuple[str, str, float, str, str]) -> str:
+    meta = str(edge[3])
+    return meta.split("|", 1)[0].strip()
+
+
+def _classified_edge_confidence_numeric(edge: tuple[str, str, float, str, str]) -> int:
+    parts = [p.strip() for p in str(edge[3]).split("|")]
+    if len(parts) < 2:
+        return 0
+    band = parts[1].strip().lower()
+    return {
+        "confirmed": 90,
+        "inferred": 65,
+        "medium": 62,
+        "low": 34,
+        "weak": 30,
+    }.get(band, 0)
+
+
+def _normalize_graph_entity_node(node_id: str) -> str:
+    """Canonical node id so person/phone edges merge across formatting variants."""
+    if not node_id or ":" not in node_id:
+        return node_id.strip()
+    kind, rest = node_id.split(":", 1)
+    k = kind.lower().strip()
+    body = rest.strip()
+    if not body:
+        return node_id.strip()
+    if k == "person":
+        bl = body.lower()
+        if bl == "unknown male / second party":
+            return UNKNOWN_ASSOCIATE_NODE_KEY
+        return _person_node_key(body)
+    if k == "phone":
+        return f"phone:{normalize_phone_number(body) or body}"
+    if k == "vehicle":
+        return f"vehicle:{body}"
+    if k == "company":
+        return f"company:{' '.join(body.lower().split())}"
+    return f"{k}:{body}"
+
+
+def _weak_classified_edge_retained_for_slice(
+    edge: tuple[str, str, float, str, str],
+    primary_person_key: str,
+) -> bool:
+    """When 'weak' links are hidden, still surface vehicle/phone/company anchors for the subject."""
+    if edge[4] != "weak":
+        return True
+    rel = _classified_edge_rel_type(edge)
+    if rel in _ALWAYS_RETAINED_WEAK_REL_TYPES:
+        return True
+    if rel.startswith(("VEHICLE_", "PHONE_", "COMPANY_")):
+        return True
+    pk = primary_person_key.lower()
+    na = _normalize_graph_entity_node(edge[0]).lower()
+    nb = _normalize_graph_entity_node(edge[1]).lower()
+    if na == pk or nb == pk:
+        return True
+    if _classified_edge_confidence_numeric(edge) >= 60:
+        return True
+    return False
+
+
+def _find_anchor_person_node_in_set(nodes: set[str], person_display: str) -> str | None:
+    pl = " ".join(person_display.strip().lower().split())
+    if not pl:
+        return None
+    for n in nodes:
+        if not n.lower().startswith("person:"):
+            continue
+        rest = n.split(":", 1)[1].strip().lower()
+        if rest == pl:
+            return n
+    return None
+
+
+def build_subject_relationship_subgraph(
+    classified_edges: list[tuple[str, str, float, str, str]],
+    primary_subject_display: str,
+    *,
+    show_weak: bool,
+) -> list[tuple[str, str, float, str, str]]:
+    """
+    Subject-centric merged graph for the current retrieval slice: start from the primary
+    person node and include all edges reachable through retained phones, vehicles,
+    companies, and unknown-associate nodes (same operational pool).
+    """
+    if not classified_edges or not primary_subject_display.strip():
+        return list(classified_edges)
+    anchor_key = _person_node_key(primary_subject_display)
+    cand: list[tuple[str, str, float, str, str]] = []
+    for e in classified_edges:
+        if e[4] != "weak":
+            cand.append(e)
+        elif show_weak:
+            cand.append(e)
+        elif _weak_classified_edge_retained_for_slice(e, anchor_key):
+            cand.append(e)
+    cand = _dedupe_classified_edges_max_strength(cand)
+    norm_edges: list[tuple[str, str, float, str, str]] = []
+    for a, b, s, lbl, lt in cand:
+        na, nb = _normalize_graph_entity_node(a), _normalize_graph_entity_node(b)
+        if na == nb:
+            continue
+        x, y = (na, nb) if na <= nb else (nb, na)
+        norm_edges.append((x, y, s, lbl, lt))
+    norm_edges = _dedupe_classified_edges_max_strength(norm_edges)
+    nodes: set[str] = set()
+    adj: dict[str, set[str]] = defaultdict(set)
+    for a, b, *_ in norm_edges:
+        nodes.add(a)
+        nodes.add(b)
+        adj[a].add(b)
+        adj[b].add(a)
+    start = anchor_key if anchor_key in nodes else _find_anchor_person_node_in_set(nodes, primary_subject_display)
+    if start is None:
+        return norm_edges
+    seen: set[str] = {start}
+    dq: deque[str] = deque([start])
+    while dq:
+        u = dq.popleft()
+        for v in adj[u]:
+            if v not in seen:
+                seen.add(v)
+                dq.append(v)
+    return [e for e in norm_edges if e[0] in seen and e[1] in seen]
+
+
+def _style_link_analysis_relationship_df(df: pd.DataFrame) -> Styler:
+    """Highlight the strongest row and rows with high confidence or direct linkage."""
+    stv = pd.to_numeric(df["Strength"], errors="coerce").fillna(0.0)
+    confn = pd.to_numeric(df["Confidence score"], errors="coerce").fillna(0.0)
+    plot_l = df["Plot style"].astype(str).str.lower()
+    is_direct = plot_l == "direct"
+    strongest_idx = int(stv.idxmax()) if len(df) else -1
+
+    def _row_style(row: pd.Series) -> list[str]:
+        idx = row.name
+        if idx == strongest_idx and strongest_idx >= 0:
+            return ["background-color: #bfdbfe; font-weight: 700"] * len(row)
+        if confn.loc[idx] >= 85 or bool(is_direct.loc[idx]):
+            return ["background-color: #e0f2fe; font-weight: 700"] * len(row)
+        return [""] * len(row)
+
+    return df.style.apply(_row_style, axis=1)
+
+
 def _unordered_edge_pair(a: str, b: str) -> tuple[str, str]:
     return (a, b) if a <= b else (b, a)
 
@@ -817,7 +976,7 @@ def _supplement_subject_vehicle_edges(
             mention_counts[raw] += 1
 
     for veh, cnt in mention_counts.items():
-        if cnt < 2 and summary.vehicles.get(veh, 0) < 2:
+        if cnt < 1 and summary.vehicles.get(veh, 0) < 1:
             continue
         vk = f"vehicle:{veh}"
         ek = _unordered_edge_pair(anchor_key, vk)
@@ -3346,6 +3505,26 @@ def main() -> None:
                 "ranked results may still include partial mentions or similarly named people."
             )
 
+    st.markdown(
+        """
+<style>
+div[data-testid="stTabs"] [data-baseweb="tab"] {
+    color: #94a3b8 !important;
+    font-weight: 400 !important;
+    font-size: 0.95rem !important;
+    border-bottom: 2px solid transparent !important;
+    padding-bottom: 0.35rem !important;
+}
+div[data-testid="stTabs"] [data-baseweb="tab"][aria-selected="true"] {
+    color: #0f172a !important;
+    font-weight: 700 !important;
+    font-size: 1rem !important;
+    border-bottom: 3px solid #ff4b4b !important;
+}
+</style>
+""",
+        unsafe_allow_html=True,
+    )
     res_tab, id_tab, ent_tab, rel_tab, time_tab = st.tabs(
         ["Evidence", "Identity Clusters", "Entity Profile", "Link Analysis", "Activity Timeline"]
     )
@@ -3518,7 +3697,6 @@ def main() -> None:
                 anchor_person = _person_phrase_from_query(search_query)
             else:
                 anchor_person = ""
-            graph_edges = non_weak_edges
             if (
                 use_person_centric
                 and anchor_person
@@ -3526,12 +3704,15 @@ def main() -> None:
                 and intent != "entity_resolution"
                 and not _identity_abang_ctx
             ):
-                graph_edges = _filter_person_centric_graph_edges(
-                    graph_edges,
-                    primary_evidence,
-                    related_evidence,
+                graph_edges = build_subject_relationship_subgraph(
+                    classified_edges,
                     anchor_person,
+                    show_weak=show_weak,
                 )
+            else:
+                graph_edges = list(non_weak_edges)
+                if show_weak:
+                    graph_edges = _dedupe_classified_edges_max_strength(graph_edges + list(weak_edges))
             gfig, gnote = build_entity_link_graph_figure(
                 ranked,
                 graph_edges,
@@ -3570,13 +3751,13 @@ def main() -> None:
                     conf_score.append("N/A")
             df_e["Confidence score"] = conf_score
             df_e["Evidence basis"] = parsed_basis
-            st.dataframe(df_e, use_container_width=True, height=420)
+            st.dataframe(_style_link_analysis_relationship_df(df_e), use_container_width=True, height=420)
             if show_weak and weak_edges:
                 st.subheader("Weak co-occurrence links (optional)")
                 df_w = pd.DataFrame(weak_edges, columns=["Entity A", "Entity B", "Strength", "Relationship type", "Plot style"])
                 df_w["Confidence score"] = "N/A"
                 df_w["Evidence basis"] = "co-occurrence only"
-                st.dataframe(df_w, use_container_width=True, height=240)
+                st.dataframe(_style_link_analysis_relationship_df(df_w), use_container_width=True, height=240)
             st.subheader("Strongest links")
             for a, b, s, lbl, lt in graph_edges[:12]:
                 st.write(f"- **{a}** ↔ **{b}** — strength {s} ({lbl}, {lt})")
