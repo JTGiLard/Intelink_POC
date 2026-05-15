@@ -1634,6 +1634,30 @@ def _person_name_parts(name: str) -> list[str]:
     return [p.strip().lower() for p in re.split(r"\s+", name.strip()) if p.strip()]
 
 
+def _identity_cluster_target_name_phrase(target_entity: str, search_query: str) -> str:
+    """Person phrase for identity clustering: prefer interpreted target over enriched retrieval query."""
+    te = _clean_target_entity((target_entity or "").strip())
+    if te and " / " not in te:
+        p = _person_phrase_from_query(te).strip()
+        if p:
+            return p
+    return _person_phrase_from_query(search_query).strip()
+
+
+def _identity_clusters_eligible_named_person(target_entity: str) -> bool:
+    """True when the interpreted target looks like a multi-token person name (not raw NL boilerplate)."""
+    te = _clean_target_entity((target_entity or "").strip())
+    if not te or " / " in te:
+        return False
+    focus = _person_phrase_from_query(te).strip()
+    if not focus:
+        return False
+    parts = _person_name_parts(focus)
+    if len(parts) < 2:
+        return False
+    return all(len(p) >= 2 and re.search(r"[A-Za-z]", p) for p in parts)
+
+
 def _fuzzy_person_similarity(query_name: str, candidate_name: str) -> float:
     q = " ".join(query_name.strip().lower().split())
     c = " ".join(candidate_name.strip().lower().split())
@@ -3941,6 +3965,7 @@ def main() -> None:
             keyword_boost = st.slider("Keyword boost for hybrid ranking", 0.0, 0.25, 0.12)
         st.markdown("---")
         st.markdown("###### Past query history")
+        st.caption("Click a past query to reload it.")
         hist = st.session_state.get("intelink_query_history", [])
         if not hist:
             st.caption("No saved queries yet.")
@@ -3949,7 +3974,7 @@ def main() -> None:
             short = (qtxt[:44] + "…") if len(qtxt) > 44 else qtxt
             label = f"{_intelink_intent_history_icon(item.get('intent', ''))} {short}"
             if st.button(label, key=f"ihist_{i}", help=item.get("ts", "")):
-                st.session_state["active_query"] = qtxt
+                st.session_state["qbox"] = qtxt
                 st.rerun()
         if st.button("Clear query history", key="intelink_hist_clear"):
             st.session_state["intelink_query_history"] = []
@@ -4149,23 +4174,21 @@ def main() -> None:
     summary = summary_semantic
     edges = edges_semantic
     timeline = timeline_semantic
-    if (
-        _is_person_like_two_word_query(search_query)
-        and has_exact_full_name_hit(ranked, search_query)
-        and intent != "relationship_between_entities"
-    ):
+    cluster_name_phrase = _identity_cluster_target_name_phrase(target_entity, search_query)
+    cluster_name_eligible = _identity_clusters_eligible_named_person(
+        target_entity
+    ) and intent != "relationship_between_entities"
+    if cluster_name_eligible and has_exact_full_name_hit(ranked, cluster_name_phrase):
         evidence_pool = primary_evidence + related_evidence
         if evidence_pool:
             summary, edges, timeline = aggregate_dashboard(evidence_pool, search_query)
-    query_person_phrase = _person_phrase_from_query(search_query)
+    query_person_phrase = cluster_name_phrase
     identity_result = IdentityClusterResult(query_phrase=query_person_phrase)
-    if _is_person_like_two_word_query(search_query) and intent != "relationship_between_entities":
+    if cluster_name_eligible:
         identity_result = build_person_identity_clusters(query_person_phrase, ranked)
 
-    corpus_exact_name_hit = (
-        _is_person_like_two_word_query(search_query)
-        and intent != "relationship_between_entities"
-        and corpus_has_exact_phrase(store.records, query_person_phrase)
+    corpus_exact_name_hit = cluster_name_eligible and corpus_has_exact_phrase(
+        store.records, query_person_phrase
     )
 
     person_query = _is_person_like_two_word_query(search_query) and intent != "relationship_between_entities"
@@ -4313,15 +4336,15 @@ def main() -> None:
     cluster_label_sel: str | None = None
     filtered_identity_clusters = (
         [cl for cl in identity_result.clusters if not selected_analysis_name or any(_chunk_mentions_selected_name(r.text, selected_analysis_name) for r, _ in cl.chunks)]
-        if person_query
+        if cluster_name_eligible
         else []
     )
-    if person_query and filtered_identity_clusters:
+    if cluster_name_eligible and filtered_identity_clusters:
         labels = [
             f"{cluster_summary_label(c)} — {c.confidence} — {len(c.chunks)} snippet(s)"
             for c in filtered_identity_clusters
         ]
-        pick_key = f"idcl_scope:{search_query}"
+        pick_key = f"idcl_scope:{cluster_name_phrase}"
         n_cl = len(filtered_identity_clusters)
         cur = st.session_state.get(pick_key)
         if not isinstance(cur, int) or cur < 0 or cur >= n_cl:
@@ -4465,31 +4488,6 @@ def main() -> None:
         score_result=score_ui,
         link_edges_classified=classified_edges,
     )
-
-    unique_entity_nodes: set[str] = set()
-    for a, b, *_ge in classified_edges:
-        unique_entity_nodes.add(a)
-        unique_entity_nodes.add(b)
-    entity_metric = (
-        len(unique_entity_nodes)
-        if unique_entity_nodes
-        else (len(summary.persons) + len(summary.vehicles) + len(summary.phones))
-    )
-    n_sources_dash = len({r.source_file for r, _ in ranked if r.source_file})
-
-    met1, met2, met3, met4 = st.columns(4)
-    with met1:
-        st.metric("Entity signals", int(entity_metric))
-    with met2:
-        st.metric("Active relationships", len(graph_edges_plot or graph_edges))
-    with met3:
-        st.metric("Source files", int(n_sources_dash))
-    with met4:
-        st.metric(
-            "Assessment",
-            dash_conf_label,
-            help=dash_conf_rationale or "Evidence / resolution scoring for this slice.",
-        )
 
     # Layout: primary row = large Relationship graph (left) + AI assessment / key IDs (right).
     # Secondary row = top sources + operational notes. Timeline list removed here — use Activity Timeline tab only.
@@ -4800,9 +4798,11 @@ def main() -> None:
             )
         if (
             intent not in ("entity_resolution", "identity_lookup", "relationship_between_entities")
-            and not _is_person_like_two_word_query(search_query)
+            and not cluster_name_eligible
         ):
-            st.info("Identity clustering runs for full-name queries (two name tokens, e.g. **John Tan**).")
+            st.info(
+                "Identity clustering is available when the interpreted target is a named person."
+            )
         elif (
             intent not in ("entity_resolution", "identity_lookup", "relationship_between_entities")
             and not filtered_identity_clusters
