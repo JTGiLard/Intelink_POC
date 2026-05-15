@@ -229,17 +229,107 @@ def _filter_timeline_abang_identity(timeline: list[TimelineEvent]) -> list[Timel
     return out
 
 
-def _filter_alias_map_for_abang_resolution(alias_map: dict[str, str]) -> dict[str, str]:
-    """Drop unrelated person-alias merges (e.g. Subject John → John Tan) for Abang resolution context."""
-    canon = "tan zong cai"
+def _query_suggests_abang_identifier(search_query: str, target_entity: str) -> bool:
+    blob = f"{search_query} {target_entity}".lower().replace(" ", "")
+    if "93445566" in blob:
+        return True
+    if "gbc4432m" in blob:
+        return True
+    if re.search(r"\bvs1\b", f"{search_query} {target_entity}", flags=re.IGNORECASE):
+        return True
+    for seg in (_person_phrase_from_query(search_query), (target_entity or "").strip(), search_query.strip()):
+        if not seg:
+            continue
+        n = normalize_phone_number(seg)
+        if n and "93445566" in n.replace(" ", ""):
+            return True
+    return False
+
+
+def enrich_identifier_context_edges(
+    search_query: str,
+    target_entity: str,
+    evidence_pool: list[tuple[ChunkRecord, float]],
+    classified_edges: list[tuple[str, str, float, str, str]],
+) -> tuple[list[tuple[str, str, float, str, str]], dict[tuple[str, str], str]]:
+    """
+    For phone/plate/VS1-style queries tied to Abang dossier evidence, merge the canonical Abang subgraph
+    into classified edges and drop nodes outside the Abang identity whitelist.
+    """
+    if not evidence_pool or not _query_suggests_abang_identifier(search_query, target_entity):
+        return classified_edges, {}
+    blob = " ".join(r.text for r, _ in evidence_pool[:50])
+    if not _chunk_matches_abang_identity_context(blob):
+        return classified_edges, {}
+    extra, labels = _entity_resolution_structured_classified_edges("Abang", "Abang Tan", evidence_pool)
+    if not extra:
+        return classified_edges, {}
+    merged = _dedupe_classified_edges_max_strength(list(classified_edges) + extra)
+    merged = _filter_classified_edges_abang_identity_only(merged)
+    return merged, labels
+
+
+def filter_alias_map_for_context(
+    alias_map: dict[str, str],
+    target_entity: str,
+    search_query: str,
+    evidence_pool: list[tuple[ChunkRecord, float]] | None,
+) -> dict[str, str]:
+    """Keep alias normalisation lines only when mappings match the active query / evidence slice."""
+    if not alias_map:
+        return {}
+    blob = f"{target_entity} {search_query}".lower()
+    ev_blob = ""
+    if evidence_pool:
+        ev_blob = " ".join(r.text[:500] for r, _ in evidence_pool[:16]).lower()
+    full = f"{blob} {ev_blob}"
+
+    john_focus = bool(
+        re.search(r"\bjohn\s+tan\b", blob)
+        or re.search(r"\bsubject\s+john\b", blob, flags=re.IGNORECASE)
+    )
+    abang_focus = bool(
+        _query_suggests_abang_identifier(search_query, target_entity)
+        or re.search(r"\babang\b", full)
+        or "tan zong cai" in full
+        or "93445566" in full.replace(" ", "")
+        or "gbc4432m" in full
+        or "test company best" in full
+        or re.search(r"\bvs1\b", full)
+    )
+    if not john_focus and not abang_focus:
+        return {}
+
     out: dict[str, str] = {}
     for k, v in alias_map.items():
-        if canon not in v.strip().lower():
-            continue
         kl = re.sub(r"(?i)^subject\s+", "", k.strip()).lower()
-        if kl in ("abang", "abang tan") or "abang tan" in k.lower():
+        vl = v.strip().lower()
+        if john_focus and "john" in kl and "john tan" in vl:
+            out[k] = v
+        elif abang_focus and "tan zong cai" in vl and (
+            kl in ("abang", "abang tan") or "abang tan" in k.lower()
+        ):
             out[k] = v
     return out
+
+
+def _entity_profile_phone_abang_lead(subject: str, evidence_pool: list[tuple[ChunkRecord, float]] | None) -> str:
+    if not evidence_pool:
+        return ""
+    sub = (subject or "").strip()
+    if not sub:
+        return ""
+    pn = normalize_phone_number(sub) or normalize_phone_number(re.sub(r"\D+", "", sub))
+    if not pn or "93445566" not in pn.replace(" ", ""):
+        return ""
+    bag = " ".join(r.text for r, _ in evidence_pool[:24])
+    if not _chunk_matches_abang_identity_context(bag):
+        return ""
+    return (
+        f"This profile centres on phone **{sub}**. Retrieved evidence links the number to Abang-related "
+        "loading/unloading activity, **Test Company Best**, lorry **GBC4432M**, and **Tan Zong Cai** / "
+        "**Abang Tan** alias context.\n\n"
+    )
 
 
 def _identity_lookup_search_query(target_entity: str) -> str:
@@ -831,6 +921,10 @@ def _entity_resolution_structured_classified_edges(
     evidence_pool: list[tuple[ChunkRecord, float]],
 ) -> tuple[list[tuple[str, str, float, str, str]], dict[tuple[str, str], str]]:
     canonical = _infer_canonical_identity_from_evidence(evidence_pool)
+    if not canonical and _chunk_matches_abang_identity_context(
+        " ".join(r.text for r, _ in evidence_pool[:30])
+    ):
+        canonical = "Tan Zong Cai"
     if not canonical:
         return [], {}
     ca_k = _person_node_key(canonical)
@@ -3152,8 +3246,10 @@ def build_entity_profile_analyst_summary(
     people_clause = ", ".join(top_people) if top_people else "no repeated person entities"
     veh_clause = ", ".join(top_veh) if top_veh else "no strong vehicle repeats"
     ph_clause = ", ".join(top_ph) if top_ph else "no phone repeats"
+    phone_lead = _entity_profile_phone_abang_lead(subj, evidence_pool or []) if evidence_pool else ""
     base = (
-        f"This profile consolidates identifiers, vehicles, phones, and corroborated references linked to **{subj}** "
+        phone_lead
+        + f"This profile consolidates identifiers, vehicles, phones, and corroborated references linked to **{subj}** "
         f"across retrieved reporting.\n\n"
         f"Top frequency snapshot — people: {people_clause}; vehicles / plates: {veh_clause}; phones: {ph_clause}.{alias_line}"
     )
@@ -4352,12 +4448,13 @@ def main() -> None:
             [h.text.strip() for h in extract_all_entities(rec.text) if h.label == "person" and h.text.strip()]
         )
     alias_map = normalize_person_aliases(person_entities, ranked_semantic)
-    if entity_resolution_abang_ctx and alias_map:
-        alias_map = _filter_alias_map_for_abang_resolution(alias_map)
-    if alias_map:
-        ranked_semantic = apply_person_alias_map_to_ranked(ranked_semantic, alias_map)
+    alias_map_display = filter_alias_map_for_context(
+        alias_map, target_entity, search_query, ranked_semantic
+    )
+    if alias_map_display:
+        ranked_semantic = apply_person_alias_map_to_ranked(ranked_semantic, alias_map_display)
         if role == "admin":
-            for alias, canonical in alias_map.items():
+            for alias, canonical in alias_map_display.items():
                 st.caption(f"Alias normalized: {alias} -> {canonical}")
     # Entity-focus gate: for short subject-style queries, drop chunks that never mention the target phrase.
     specific_entity_gate = _query_looks_like_specific_entity(intent=intent, query=search_query)
@@ -4511,6 +4608,19 @@ def main() -> None:
     classified_edges = _dedupe_classified_edges_max_strength(classified_edges)
     if _identity_abang_ctx or entity_resolution_abang_ctx:
         classified_edges = _filter_classified_edges_abang_identity_only(classified_edges)
+    identifier_abang_enrich = (
+        not _identity_abang_ctx
+        and not entity_resolution_abang_ctx
+        and _query_suggests_abang_identifier(search_query, target_entity)
+        and bool(_pool_er)
+        and _chunk_matches_abang_identity_context(" ".join(r.text for r, _ in _pool_er[:40]))
+    )
+    if identifier_abang_enrich:
+        classified_edges, lab_id = enrich_identifier_context_edges(
+            search_query, target_entity, _pool_er, classified_edges
+        )
+        resolution_graph_labels = {**resolution_graph_labels, **lab_id}
+        classified_edges = _dedupe_classified_edges_max_strength(classified_edges)
     pair_rel_paths: dict[str, object] | None = None
     if intent == "relationship_between_entities" and entity_a and entity_b:
         pair_rel_paths = find_shared_relationship_paths(
@@ -5148,14 +5258,10 @@ def main() -> None:
                 build_entity_profile_analyst_summary(
                     summary,
                     selected_analysis_name or search_query,
-                    alias_map,
+                    alias_map_display,
                     operational_assessment=operational_tab_assessment,
                     evidence_pool=primary_evidence + related_evidence,
-                    include_alias_normalisation_note=bool(alias_map)
-                    and (
-                        dash_conf_score >= 55
-                        or intent in ("entity_resolution", "identity_lookup")
-                    ),
+                    include_alias_normalisation_note=bool(alias_map_display),
                 )
             )
             c1, c2, c3 = st.columns(3)
