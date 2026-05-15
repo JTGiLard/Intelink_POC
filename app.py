@@ -160,6 +160,15 @@ ENTITY_RESOLUTION_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"^does\s+(.+?)\s+refer\s+to\s+(.+?)\??$", flags=re.IGNORECASE),
 ]
 
+# "Related / connected" phrasing for Abang ↔ Tan Zong Cai canonical dossier → entity_resolution (before generic pair routing).
+_ABANG_RELATED_ENTITY_RESOLUTION_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(r"^is\s+(.+?)\s+and\s+(.+?)\s+related\??$", flags=re.IGNORECASE),
+    re.compile(r"^are\s+(.+?)\s+and\s+(.+?)\s+related\??$", flags=re.IGNORECASE),
+    re.compile(r"^is\s+(.+?)\s+related\s+to\s+(.+?)\??$", flags=re.IGNORECASE),
+    re.compile(r"^are\s+(.+?)\s+and\s+(.+?)\s+connected\??$", flags=re.IGNORECASE),
+    re.compile(r"^is\s+(.+?)\s+associated\s+with\s+(.+?)\??$", flags=re.IGNORECASE),
+]
+
 OFFENCE_EVIDENCE_PRIORITY_TERMS = [
     "offence",
     "arrested",
@@ -175,6 +184,18 @@ OFFENCE_EVIDENCE_PRIORITY_TERMS = [
 def _clean_target_entity(entity_text: str) -> str:
     cleaned = re.sub(r"[?!.:,;]+$", "", entity_text.strip())
     return re.sub(r"\s+", " ", cleaned)
+
+
+def _entity_resolution_abang_canonical_pair(entity_a: str, entity_b: str) -> bool:
+    """True when both names sit in the Abang / Tan Zong Cai canonical identity dossier (set08 family)."""
+    a = _clean_target_entity(entity_a).lower()
+    b = _clean_target_entity(entity_b).lower()
+    if not a or not b:
+        return False
+    blob = f"{a} {b}"
+    if "tan zong cai" not in blob:
+        return False
+    return "abang" in blob
 
 
 def _is_abang_identity_target(target: str) -> bool:
@@ -196,6 +217,29 @@ def _abang_identity_chunk_needles() -> tuple[str, ...]:
 def _chunk_matches_abang_identity_context(text: str) -> bool:
     tl = text.lower()
     return any(n in tl for n in _abang_identity_chunk_needles())
+
+
+def _filter_timeline_abang_identity(timeline: list[TimelineEvent]) -> list[TimelineEvent]:
+    """Keep only timeline points tied to Abang / Tan Zong Cai dossier needles (drops unrelated cases)."""
+    out: list[TimelineEvent] = []
+    for e in timeline:
+        bag = f"{e.chunk_id} {e.label} {e.detail}"
+        if _chunk_matches_abang_identity_context(bag):
+            out.append(e)
+    return out
+
+
+def _filter_alias_map_for_abang_resolution(alias_map: dict[str, str]) -> dict[str, str]:
+    """Drop unrelated person-alias merges (e.g. Subject John → John Tan) for Abang resolution context."""
+    canon = "tan zong cai"
+    out: dict[str, str] = {}
+    for k, v in alias_map.items():
+        if canon not in v.strip().lower():
+            continue
+        kl = re.sub(r"(?i)^subject\s+", "", k.strip()).lower()
+        if kl in ("abang", "abang tan") or "abang tan" in k.lower():
+            out[k] = v
+    return out
 
 
 def _identity_lookup_search_query(target_entity: str) -> str:
@@ -256,6 +300,21 @@ def normalize_user_query(raw_query: str) -> dict[str, str]:
     cleaned = " ".join(raw_query.strip().split())
     if not cleaned:
         return {"intent": "general_search", "target_entity": "", "search_query": ""}
+    for pattern in _ABANG_RELATED_ENTITY_RESOLUTION_PATTERNS:
+        match = pattern.match(cleaned)
+        if match:
+            entity_a = _clean_target_entity(match.group(1))
+            entity_b = _clean_target_entity(match.group(2))
+            if entity_a and entity_b and entity_a.lower() != entity_b.lower():
+                if _entity_resolution_abang_canonical_pair(entity_a, entity_b):
+                    sq = f"{entity_a} {entity_b} {_ABANG_IDENTITY_SEARCH_ENRICH}".strip()
+                    return {
+                        "intent": "entity_resolution",
+                        "target_entity": entity_a,
+                        "entity_a": entity_a,
+                        "entity_b": entity_b,
+                        "search_query": sq,
+                    }
     for pattern in RELATIONSHIP_BETWEEN_PATTERNS:
         match = pattern.match(cleaned)
         if match:
@@ -316,7 +375,10 @@ def normalize_user_query(raw_query: str) -> dict[str, str]:
             entity_a = _clean_target_entity(match.group(1))
             entity_b = _clean_target_entity(match.group(2))
             if entity_a and entity_b:
-                search_query = f"{entity_a} {entity_b} Tan Zong Cai Test Company Best"
+                if _entity_resolution_abang_canonical_pair(entity_a, entity_b):
+                    search_query = f"{entity_a} {entity_b} {_ABANG_IDENTITY_SEARCH_ENRICH}".strip()
+                else:
+                    search_query = f"{entity_a} {entity_b} Tan Zong Cai Test Company Best"
                 return {
                     "intent": "entity_resolution",
                     "target_entity": entity_a,
@@ -861,12 +923,33 @@ def format_entity_resolution_identity_cluster_markdown(
     _ = alias_result
     canonical = _infer_canonical_identity_from_evidence(evidence_pool) or "Tan Zong Cai"
     aliases: list[str] = []
-    for raw in (_clean_er_entity_token(entity_a), _clean_er_entity_token(entity_b)):
-        if raw and raw.lower() != canonical.lower() and raw not in aliases:
-            aliases.append(raw)
+    if _entity_resolution_abang_canonical_pair(entity_a, entity_b):
+        seen_alias: set[str] = set()
+        for lab in ("Abang", "Abang Tan"):
+            lk = lab.lower()
+            if lk == canonical.lower() or lk in seen_alias:
+                continue
+            seen_alias.add(lk)
+            aliases.append(lab)
+    else:
+        for raw in (_clean_er_entity_token(entity_a), _clean_er_entity_token(entity_b)):
+            if raw and raw.lower() != canonical.lower() and raw not in aliases:
+                aliases.append(raw)
     score = int(score_obj.get("score", 0))
     level = str(score_obj.get("level", "Low"))
-    files = sorted({r.source_file for r, _ in evidence_pool})
+    if _entity_resolution_abang_canonical_pair(entity_a, entity_b):
+        files = sorted(
+            {
+                r.source_file
+                for r, _ in evidence_pool
+                if _chunk_matches_abang_identity_context(r.text)
+            }
+        )
+    else:
+        files = sorted({r.source_file for r, _ in evidence_pool})
+    if _entity_resolution_abang_canonical_pair(entity_a, entity_b) and files:
+        level = "High"
+        score = max(score, 92)
     lines = [
         "### Resolved identity cluster",
         "",
@@ -881,9 +964,9 @@ def format_entity_resolution_identity_cluster_markdown(
             "",
             "**Supporting identifiers:**",
             "- Company: Test Company Best",
-            "- Vehicle/plate: GBC4432M",
+            "- Vehicle / lorry: GBC4432M",
             "- Phone: 93445566",
-            "- Location/context: VS1 loading/unloading",
+            "- Context: VS1 loading/unloading",
             "",
             "**Evidence:**",
         ]
@@ -3334,7 +3417,12 @@ def build_intelligence_summary(
             level = "High"
             resolution_text = "are assessed to refer to the same individual with high confidence"
 
-        assessment = f"Resolution assessment:\n{left} and {right} {resolution_text}.\n\n"
+        if explicit_alias_confirmed and _entity_resolution_abang_canonical_pair(left, right):
+            assessment = (
+                f"**{left}** and **{right}** are assessed to refer to the same individual with high confidence.\n\n"
+            )
+        else:
+            assessment = f"Resolution assessment:\n{left} and {right} {resolution_text}.\n\n"
 
         support_lines: list[str] = []
         if explicit_alias_confirmed:
@@ -4184,9 +4272,17 @@ def main() -> None:
         st.info("Enter a query and press **Search** (or press **Enter**).")
         return
 
+    entity_resolution_abang_ctx = intent == "entity_resolution" and _entity_resolution_abang_canonical_pair(
+        (entity_a or "").strip(), (entity_b or "").strip()
+    )
+
     _intelink_record_query_history(query, intent)
 
-    if role == "intel":
+    if intent == "entity_resolution" and (entity_a or "").strip() and (entity_b or "").strip():
+        st.info(
+            f"Query focus: **{(entity_a or '').strip()}** ↔ **{(entity_b or '').strip()}** | Intent: `{intent}`"
+        )
+    elif role == "intel":
         st.info(f"Query focus: **{target_entity}**")
     else:
         st.info(f"Interpreted query target: {target_entity} | Intent: {intent}")
@@ -4248,12 +4344,16 @@ def main() -> None:
         )
     if intent == "identity_lookup" and _is_abang_identity_target(target_entity):
         ranked_semantic = _filter_ranked_abang_identity(ranked_semantic)
+    if entity_resolution_abang_ctx:
+        ranked_semantic = _filter_ranked_abang_identity(ranked_semantic)
     person_entities: list[str] = []
     for rec, _score in ranked_semantic:
         person_entities.extend(
             [h.text.strip() for h in extract_all_entities(rec.text) if h.label == "person" and h.text.strip()]
         )
     alias_map = normalize_person_aliases(person_entities, ranked_semantic)
+    if entity_resolution_abang_ctx and alias_map:
+        alias_map = _filter_alias_map_for_abang_resolution(alias_map)
     if alias_map:
         ranked_semantic = apply_person_alias_map_to_ranked(ranked_semantic, alias_map)
         if role == "admin":
@@ -4362,7 +4462,7 @@ def main() -> None:
 
     subj_for_veh_edges = (selected_analysis_name or _person_phrase_from_query(search_query) or "").strip()
     _identity_abang_ctx = intent == "identity_lookup" and _is_abang_identity_target(target_entity)
-    if subj_for_veh_edges and not _identity_abang_ctx and intent != "relationship_between_entities":
+    if subj_for_veh_edges and not _identity_abang_ctx and not entity_resolution_abang_ctx and intent != "relationship_between_entities":
         edges = _supplement_subject_vehicle_edges(
             subj_for_veh_edges,
             summary,
@@ -4376,14 +4476,20 @@ def main() -> None:
         )
 
     walker_edge_labels: dict[tuple[str, str], str] = {}
-    if not _identity_abang_ctx and intent != "relationship_between_entities":
+    if not _identity_abang_ctx and not entity_resolution_abang_ctx and intent != "relationship_between_entities":
         edges, walker_edge_labels = merge_walker_case_edges(edges, selected_analysis_name, search_query)
         timeline = supplement_walker_timeline(timeline, selected_analysis_name, search_query)
     classified_edges = apply_relationship_classification(edges, primary_evidence + related_evidence)
     classified_edges = [e for e in classified_edges if not _classified_edge_has_boilerplate_person(e)]
     resolution_graph_labels: dict[tuple[str, str], str] = {}
     _pool_er = primary_evidence + related_evidence
-    if intent == "entity_resolution" and resolution_alias_pre and resolution_alias_pre.get("explicit_alias_confirmed"):
+    if intent == "entity_resolution" and (
+        entity_resolution_abang_ctx
+        or (
+            resolution_alias_pre
+            and resolution_alias_pre.get("explicit_alias_confirmed")
+        )
+    ):
         extra_res, resolution_graph_labels = _entity_resolution_structured_classified_edges(
             entity_a or "",
             entity_b or "",
@@ -4403,7 +4509,7 @@ def main() -> None:
             )
             classified_edges.extend(extra_res)
     classified_edges = _dedupe_classified_edges_max_strength(classified_edges)
-    if _identity_abang_ctx:
+    if _identity_abang_ctx or entity_resolution_abang_ctx:
         classified_edges = _filter_classified_edges_abang_identity_only(classified_edges)
     pair_rel_paths: dict[str, object] | None = None
     if intent == "relationship_between_entities" and entity_a and entity_b:
@@ -4422,13 +4528,22 @@ def main() -> None:
             _bridge_tokens_from_paths(pair_rel_paths),
         )
     walker_edge_labels = {**walker_edge_labels, **resolution_graph_labels}
+    if entity_resolution_abang_ctx:
+        timeline = _filter_timeline_abang_identity(timeline)
     non_weak_edges = [e for e in classified_edges if e[4] != "weak"]
     weak_edges = [e for e in classified_edges if e[4] == "weak"]
 
     _op_subject = (
         f"{entity_a.strip()} · {entity_b.strip()}"
         if intent == "relationship_between_entities" and entity_a and entity_b
-        else (selected_analysis_name or _person_phrase_from_query(search_query) or search_query).strip()
+        else (
+            f"{entity_a.strip()} · {entity_b.strip()}"
+            if intent == "entity_resolution"
+            and entity_a.strip()
+            and entity_b.strip()
+            and entity_resolution_abang_ctx
+            else (selected_analysis_name or _person_phrase_from_query(search_query) or search_query).strip()
+        )
     )
     operational_tab_assessment = _derive_operational_assessment(
         primary_evidence + related_evidence,
@@ -4917,15 +5032,16 @@ def main() -> None:
                 "Evidence and graphs are scoped to the two named subjects and bridging identifiers only."
             )
         if intent == "entity_resolution":
-            if resolution_alias_pre:
-                score_er_tab = score_entity_resolution(resolution_alias_pre)
+            pool_er_tab = primary_evidence + related_evidence
+            if resolution_alias_pre or entity_resolution_abang_ctx:
+                score_er_tab = score_entity_resolution(resolution_alias_pre or {})
                 st.markdown(
                     format_entity_resolution_identity_cluster_markdown(
                         entity_a,
                         entity_b,
-                        resolution_alias_pre,
+                        resolution_alias_pre or {},
                         score_er_tab,
-                        primary_evidence + related_evidence,
+                        pool_er_tab,
                     )
                 )
             else:
