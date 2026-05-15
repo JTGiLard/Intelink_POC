@@ -69,6 +69,9 @@ DEBUG_MODE = False
 EVIDENCE_RELEVANCE_THRESHOLD_PRIMARY = 0.45
 EVIDENCE_RELEVANCE_THRESHOLD_RELATED = 0.24
 RELATIONSHIP_EDGE_NORMALIZED_MIN = 0.22
+# Person-focused weak-match dashboard (no mission board / ops / tabs).
+WEAK_MATCH_CONFIDENCE_LT = 54
+WEAK_MATCH_PRIMARY_LT = EVIDENCE_RELEVANCE_THRESHOLD_PRIMARY
 
 
 def _person_phrase_from_query(query: str) -> str:
@@ -1867,21 +1870,29 @@ def normalize_person_aliases(
             if candidate == alias:
                 continue
             cand_info = evidence_by_person.get(candidate, {})
-            score = 0.0
+            id_score = 0.0
             if isinstance(alias_phone, set) and isinstance(cand_info.get("phones"), set):
                 if alias_phone & cand_info.get("phones", set()):
-                    score += 3.0
+                    id_score += 3.0
             if isinstance(alias_vehicle, set) and isinstance(cand_info.get("vehicles"), set):
                 if alias_vehicle & cand_info.get("vehicles", set()):
-                    score += 3.0
+                    id_score += 3.0
             if isinstance(alias_chunks, set) and isinstance(cand_info.get("chunks"), set):
                 if alias_chunks & cand_info.get("chunks", set()):
-                    score += 2.0
-            score += _fuzzy_person_similarity(alias.replace("Subject ", "").strip(), candidate) * 2.0
-            if score > best_score:
-                best_score = score
+                    id_score += 2.0
+            fuzz_part = _fuzzy_person_similarity(alias.replace("Subject ", "").strip(), candidate) * 2.0
+            total_score = id_score + fuzz_part
+            if total_score > best_score:
+                best_score = total_score
                 best_name = candidate
-        if best_name and best_score >= 4.0:
+        id_only = best_score - (
+            _fuzzy_person_similarity(alias.replace("Subject ", "").strip(), (best_name or "").strip()) * 2.0
+        )
+        if (
+            best_name
+            and best_score >= 4.0
+            and (id_only >= 3.0 or (id_only >= 2.0 and best_score >= 5.5))
+        ):
             alias_map[alias] = best_name
     return alias_map
 
@@ -2369,6 +2380,90 @@ def score_evidence_confidence(
         rationale = "Confidence reduced due to weak contextual-only links."
 
     return {"score": score, "level": level, "rationale": rationale, "drivers": drivers, "penalties": penalties}
+
+
+def _is_weak_match_mode(
+    *,
+    intent: str,
+    corpus_exact_name_hit: bool,
+    exact_person_match: bool,
+    cluster_name_eligible: bool,
+    person_query: bool,
+    closest_person_matches: list[tuple[str, int, float]],
+    primary_evidence: list[tuple[ChunkRecord, float]],
+    evidence_confidence_score: int,
+    fuzzy_name_context: bool,
+) -> bool:
+    """True when the briefing should collapse to a weak-match panel (no mission board / ops / tabs)."""
+    if intent in ("entity_resolution", "relationship_between_entities", "identity_lookup"):
+        return False
+    if intent not in (
+        "entity_overview",
+        "general_search",
+        "offence_summary",
+        "relationship_lookup",
+        "vehicle_lookup",
+    ):
+        return False
+    name_focus = cluster_name_eligible or person_query
+    if not name_focus:
+        return False
+    if exact_person_match:
+        return False
+    if corpus_exact_name_hit:
+        return False
+    top_pri = max((float(s) for _, s in primary_evidence), default=0.0)
+    if top_pri >= WEAK_MATCH_PRIMARY_LT and not fuzzy_name_context:
+        return False
+    ambiguous_name = fuzzy_name_context or bool(closest_person_matches)
+    if not ambiguous_name:
+        return False
+    if evidence_confidence_score >= WEAK_MATCH_CONFIDENCE_LT:
+        return False
+    return True
+
+
+def _format_weak_match_analyst_brief(
+    query_display: str,
+    closest_person_matches: list[tuple[str, int, float]],
+    selected_analysis_name: str | None,
+    *,
+    limit: int = 8,
+) -> str:
+    qd = (query_display or "").strip() or "this query"
+    rows: list[str] = []
+    seen: set[str] = set()
+    pool: list[tuple[str, int, float]] = []
+    if selected_analysis_name and selected_analysis_name.strip():
+        sn = selected_analysis_name.strip()
+        seen.add(sn.lower())
+        sim_pick = 0.0
+        for name, cnt, sim in closest_person_matches:
+            if name.strip().lower() == sn.lower():
+                sim_pick = float(sim)
+                break
+        pool.append((sn, 0, sim_pick))
+    for name, cnt, sim in closest_person_matches:
+        if name.strip().lower() in seen:
+            continue
+        seen.add(name.strip().lower())
+        pool.append((name, cnt, sim))
+    for name, _cnt, sim in pool[:limit]:
+        sim_pct = f"{100.0 * float(sim):.0f}%" if sim and float(sim) > 0 else "—"
+        rows.append(f"- **{name}** — contextual similarity **{sim_pct}** (not verified as the same person)")
+    matches_md = "\n".join(rows) if rows else "- _(No close person entities in this retrieval slice)_"
+    return (
+        f"No confirmed exact match was found for **{qd}**.\n\n"
+        "Possible similar entities were retrieved from contextual references, but identity confidence is "
+        "insufficient for operational assessment.\n\n"
+        f"Possible matches:\n{matches_md}\n\n"
+        "Please refine the query using:\n"
+        "- **full name**\n"
+        "- **phone**\n"
+        "- **vehicle**\n"
+        "- **company**\n"
+        "- **alias**"
+    )
 
 
 def extract_alias_evidence(
@@ -2952,13 +3047,15 @@ def build_entity_profile_analyst_summary(
     alias_map: dict[str, str],
     operational_assessment: dict[str, object] | None = None,
     evidence_pool: list[tuple[ChunkRecord, float]] | None = None,
+    *,
+    include_alias_normalisation_note: bool = True,
 ) -> str:
     subj = subject.strip() or "the subject"
     top_people = [f"{n} ({c})" for n, c in summary.persons.most_common(4)]
     top_veh = [f"{v} ({c})" for v, c in summary.vehicles.most_common(4)]
     top_ph = [f"{p} ({c})" for p, c in summary.phones.most_common(4)]
     alias_line = ""
-    if alias_map:
+    if include_alias_normalisation_note and alias_map:
         pairs = [f"{a} → {b}" for a, b in list(alias_map.items())[:4]]
         alias_line = "\n\nAlias normalisation applied: " + "; ".join(pairs) + "."
     people_clause = ", ".join(top_people) if top_people else "no repeated person entities"
@@ -3666,7 +3763,8 @@ section[data-testid="stSidebar"] .stMarkdown strong { color: #edf4ff !important;
   margin-bottom: 0.85rem;
   box-shadow: 0 16px 48px rgba(0,0,0,0.4), inset 0 1px 0 rgba(255,255,255,0.04);
 }
-.intelink-graph-card { min-height: 420px; }
+.intelink-graph-card { min-height: 0; }
+.intelink-graph-head { margin-bottom: 0.5rem; }
 .intelink-assessment-card .stMarkdown p,
 .intelink-assessment-card .stMarkdown li { color: #c7d4ea !important; }
 .intelink-assessment-card .stMarkdown strong { color: #edf4ff !important; }
@@ -3709,7 +3807,7 @@ div[data-testid="stMetric"] [data-testid="stMetricValue"] { color: #d6e6ff !impo
 .intel-tl-date { font-size:0.72rem; color:#7f93b2; letter-spacing:0.04em; text-transform:uppercase; }
 .intel-tl-lbl { font-weight:600; color:#e7f1ff; font-size:0.88rem; }
 .intel-tl-det { font-size:0.8rem; color:#b8c7e0; line-height:1.35; }
-.intel-legend-row { display:flex; flex-wrap:wrap; gap:8px 14px; font-size:0.72rem; color:#7f93b2; margin-top:8px; }
+.intel-legend-row { display:flex; flex-wrap:wrap; gap:8px 14px; font-size:0.72rem; color:#7f93b2; margin-top:10px; margin-bottom:14px; }
 .intel-legend-swatch { display:inline-block; width:10px; height:10px; border-radius:50%; margin-right:5px; vertical-align:middle; }
 .intel-evidence-meta {
   font-size: 0.78rem;
@@ -4332,6 +4430,95 @@ def main() -> None:
         classified_edges=classified_edges,
     )
 
+    alias_result_ui: dict[str, object] | None = None
+    score_ui: dict[str, object] | None = None
+    conf_tab: dict[str, object] | None = None
+    dash_conf_label = "—"
+    dash_conf_score = 0
+    dash_conf_rationale = ""
+    fuzzy_ctx = False
+
+    if intent == "entity_resolution":
+        alias_result_ui = resolution_alias_pre or extract_alias_evidence(
+            primary_evidence + related_evidence,
+            entity_a or target_entity,
+            entity_b,
+        )
+        score_ui = score_entity_resolution(alias_result_ui)
+        dash_conf_label = str(score_ui["level"])
+        dash_conf_score = int(score_ui["score"])
+    elif intent == "identity_lookup" and _is_abang_identity_target(target_entity):
+        alias_result_ui = resolution_alias_pre or extract_alias_evidence(
+            primary_evidence + related_evidence,
+            "Abang",
+            "Abang Tan",
+        )
+        score_ui = score_entity_resolution(alias_result_ui)
+        dash_conf_label = str(score_ui["level"])
+        dash_conf_score = int(score_ui["score"])
+    elif intent in {
+        "entity_overview",
+        "general_search",
+        "offence_summary",
+        "vehicle_lookup",
+        "relationship_lookup",
+        "relationship_between_entities",
+    }:
+        fuzzy_ctx = bool(
+            (person_query or cluster_name_eligible)
+            and not exact_person_match
+            and bool(selected_analysis_name)
+        )
+        conf_tab = score_evidence_confidence(
+            search_query=search_query,
+            selected_analysis_name=selected_analysis_name,
+            exact_match=has_exact_match(search_query, primary_evidence),
+            evidence_pool=primary_evidence + related_evidence,
+            summary=summary,
+            classified_edges=classified_edges,
+            fuzzy_name_context=fuzzy_ctx,
+        )
+        dash_conf_label = str(conf_tab["level"])
+        dash_conf_score = int(conf_tab["score"])
+        dash_conf_rationale = str(conf_tab["rationale"])
+
+    weak_match_mode = _is_weak_match_mode(
+        intent=intent,
+        corpus_exact_name_hit=corpus_exact_name_hit,
+        exact_person_match=exact_person_match,
+        cluster_name_eligible=cluster_name_eligible,
+        person_query=person_query,
+        closest_person_matches=closest_person_matches,
+        primary_evidence=primary_evidence,
+        evidence_confidence_score=dash_conf_score,
+        fuzzy_name_context=fuzzy_ctx,
+    )
+    if weak_match_mode:
+        st.markdown(
+            '<h2 class="intelink-mission-title">Analyst briefing</h2>',
+            unsafe_allow_html=True,
+        )
+        st.warning(
+            "Weak retrieval match — the queried name is **not** confirmed in primary evidence. "
+            "Only the summary below and unverified snippets are shown; mission-board analytics are withheld."
+        )
+        q_show = (target_entity or search_query or query or "").strip()
+        weak_brief = _format_weak_match_analyst_brief(
+            q_show,
+            closest_person_matches,
+            selected_analysis_name,
+        )
+        st.markdown('<div class="intelink-card intelink-assessment-card">', unsafe_allow_html=True)
+        st.markdown("###### AI summary")
+        st.markdown(weak_brief)
+        st.markdown("</div>", unsafe_allow_html=True)
+        with st.expander("Top retrieved snippets (unverified context)", expanded=False):
+            for r, s in ranked[:8]:
+                st.caption(f"{r.source_type} · {r.doc_title} · score {float(s):.3f}")
+                st.markdown(highlight_query(r.text[:3200], search_query))
+                st.caption(f"`{r.source_file}` · `{r.chunk_id}`")
+        return
+
     summary_evidence_sel: list[tuple[ChunkRecord, float]] | None = None
     cluster_label_sel: str | None = None
     filtered_identity_clusters = (
@@ -4363,52 +4550,6 @@ def main() -> None:
         chosen = filtered_identity_clusters[pick_ix]
         summary_evidence_sel = chosen.chunks
         cluster_label_sel = cluster_summary_label(chosen)
-
-    alias_result_ui: dict[str, object] | None = None
-    score_ui: dict[str, object] | None = None
-    conf_tab: dict[str, object] | None = None
-    dash_conf_label = "—"
-    dash_conf_score = 0
-    dash_conf_rationale = ""
-
-    if intent == "entity_resolution":
-        alias_result_ui = resolution_alias_pre or extract_alias_evidence(
-            primary_evidence + related_evidence,
-            entity_a or target_entity,
-            entity_b,
-        )
-        score_ui = score_entity_resolution(alias_result_ui)
-        dash_conf_label = str(score_ui["level"])
-        dash_conf_score = int(score_ui["score"])
-    elif intent == "identity_lookup" and _is_abang_identity_target(target_entity):
-        alias_result_ui = resolution_alias_pre or extract_alias_evidence(
-            primary_evidence + related_evidence,
-            "Abang",
-            "Abang Tan",
-        )
-        score_ui = score_entity_resolution(alias_result_ui)
-        dash_conf_label = str(score_ui["level"])
-        dash_conf_score = int(score_ui["score"])
-    elif intent in {
-        "entity_overview",
-        "offence_summary",
-        "vehicle_lookup",
-        "relationship_lookup",
-        "relationship_between_entities",
-    }:
-        fuzzy_ctx = bool(person_query and not exact_person_match and selected_analysis_name)
-        conf_tab = score_evidence_confidence(
-            search_query=search_query,
-            selected_analysis_name=selected_analysis_name,
-            exact_match=has_exact_match(search_query, primary_evidence),
-            evidence_pool=primary_evidence + related_evidence,
-            summary=summary,
-            classified_edges=classified_edges,
-            fuzzy_name_context=fuzzy_ctx,
-        )
-        dash_conf_label = str(conf_tab["level"])
-        dash_conf_score = int(conf_tab["score"])
-        dash_conf_rationale = str(conf_tab["rationale"])
 
     walker_ctx = intent != "relationship_between_entities" and should_activate_walker_scaffold(
         search_query,
@@ -4494,10 +4635,39 @@ def main() -> None:
     row_graph, row_ai = st.columns([1.72, 1.0], gap="medium")
 
     with row_graph:
-        st.markdown('<div class="intelink-card intelink-graph-card">', unsafe_allow_html=True)
-        st.markdown("###### Relationship graph")
         if gfig is not None:
+            st.markdown('<div class="intelink-card intelink-graph-card">', unsafe_allow_html=True)
+            st.markdown('<div class="intelink-graph-head">', unsafe_allow_html=True)
+            st.markdown("###### Relationship graph")
+            st.markdown("</div>", unsafe_allow_html=True)
             st.plotly_chart(gfig, use_container_width=True)
+            if gnote:
+                st.caption(gnote)
+            st.markdown(
+                '<div class="intel-legend-row">'
+                '<span><span class="intel-legend-swatch" style="background:#22d3ee;box-shadow:0 0 8px #22d3ee88"></span>Person</span>'
+                '<span><span class="intel-legend-swatch" style="background:#34d399"></span>Vehicle</span>'
+                '<span><span class="intel-legend-swatch" style="background:#fb923c"></span>Phone</span>'
+                '<span><span class="intel-legend-swatch" style="background:#a78bfa"></span>Company</span>'
+                '<span><span class="intel-legend-swatch" style="background:#64748b"></span>Unknown associate</span>'
+                '<span style="color:#7f93b2;">Edges: solid = direct · dashed = indirect · dotted = weak</span>'
+                "</div>",
+                unsafe_allow_html=True,
+            )
+            c_ma, c_mb = st.columns(2)
+            with c_ma:
+                st.caption("Strongest link")
+                st.markdown(
+                    f'<div style="font-size:0.82rem;color:#b8c7e0;">{html.escape(strongest_l, quote=True)}</div>',
+                    unsafe_allow_html=True,
+                )
+            with c_mb:
+                st.caption("Most connected")
+                st.markdown(
+                    f'<div style="font-size:0.82rem;color:#b8c7e0;">{html.escape(most_conn_l, quote=True)}</div>',
+                    unsafe_allow_html=True,
+                )
+            st.markdown("</div>", unsafe_allow_html=True)
         elif not classified_edges:
             st.caption("No co-occurrence edges in this retrieval slice.")
         elif graph_edges and not graph_edges_plot:
@@ -4509,33 +4679,6 @@ def main() -> None:
             )
         else:
             st.warning("Graph did not render.")
-        if gnote and gfig is not None:
-            st.caption(gnote)
-        st.markdown(
-            '<div class="intel-legend-row">'
-            '<span><span class="intel-legend-swatch" style="background:#22d3ee;box-shadow:0 0 8px #22d3ee88"></span>Person</span>'
-            '<span><span class="intel-legend-swatch" style="background:#34d399"></span>Vehicle</span>'
-            '<span><span class="intel-legend-swatch" style="background:#fb923c"></span>Phone</span>'
-            '<span><span class="intel-legend-swatch" style="background:#a78bfa"></span>Company</span>'
-            '<span><span class="intel-legend-swatch" style="background:#64748b"></span>Unknown associate</span>'
-            '<span style="color:#7f93b2;">Edges: solid = direct · dashed = indirect · dotted = weak</span>'
-            "</div>",
-            unsafe_allow_html=True,
-        )
-        c_ma, c_mb = st.columns(2)
-        with c_ma:
-            st.caption("Strongest link")
-            st.markdown(
-                f'<div style="font-size:0.82rem;color:#b8c7e0;">{html.escape(strongest_l, quote=True)}</div>',
-                unsafe_allow_html=True,
-            )
-        with c_mb:
-            st.caption("Most connected")
-            st.markdown(
-                f'<div style="font-size:0.82rem;color:#b8c7e0;">{html.escape(most_conn_l, quote=True)}</div>',
-                unsafe_allow_html=True,
-            )
-        st.markdown("</div>", unsafe_allow_html=True)
 
     with row_ai:
         st.markdown('<div class="intelink-card intelink-assessment-card">', unsafe_allow_html=True)
@@ -4882,6 +5025,11 @@ def main() -> None:
                     alias_map,
                     operational_assessment=operational_tab_assessment,
                     evidence_pool=primary_evidence + related_evidence,
+                    include_alias_normalisation_note=bool(alias_map)
+                    and (
+                        dash_conf_score >= 55
+                        or intent in ("entity_resolution", "identity_lookup")
+                    ),
                 )
             )
             c1, c2, c3 = st.columns(3)

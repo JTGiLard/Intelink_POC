@@ -767,23 +767,23 @@ def build_entity_link_graph_figure(
         )
 
         fig.update_layout(
-            title=dict(text="Relationship graph (current retrieval only)", font=dict(size=15, color="#e2e8f0")),
+            title=None,
             xaxis=dict(range=[-2, 2], visible=False, gridcolor="rgba(30,41,59,0.4)"),
             yaxis=dict(range=[-2, 2], visible=False, gridcolor="rgba(30,41,59,0.4)"),
             showlegend=True,
             legend=dict(
                 orientation="h",
                 yanchor="bottom",
-                y=1.02,
+                y=1.04,
                 xanchor="left",
                 x=0.0,
                 bgcolor="rgba(15,23,42,0.75)",
-                font=dict(color="#e2e8f0", size=11),
+                font=dict(color="#e2e8f0", size=10),
             ),
             plot_bgcolor="#0f1629",
             paper_bgcolor="#0a0e1a",
             font=dict(color="#e2e8f0"),
-            margin=dict(l=20, r=20, t=56, b=20),
+            margin=dict(l=20, r=20, t=64, b=20),
             height=int(figure_height),
             annotations=ann,
         )
