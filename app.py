@@ -2423,46 +2423,54 @@ def _is_weak_match_mode(
     return True
 
 
+def _weak_match_exclude_name_keys(*phrases: str) -> set[str]:
+    """Normalized name keys to omit from possible-match list (raw query / target, not retrieved entities)."""
+    keys: set[str] = set()
+    for p in phrases:
+        raw = (p or "").strip()
+        if not raw:
+            continue
+        keys.add(_normalize_person_name(raw))
+        keys.add(_normalize_person_name(_person_phrase_from_query(raw)))
+    keys.discard("")
+    return keys
+
+
 def _format_weak_match_analyst_brief(
     query_display: str,
-    closest_person_matches: list[tuple[str, int, float]],
-    selected_analysis_name: str | None,
+    match_phrase: str,
+    summary: EntitySummary,
     *,
+    excluded_phrases: tuple[str, ...] = (),
     limit: int = 8,
 ) -> str:
     qd = (query_display or "").strip() or "this query"
-    rows: list[str] = []
-    seen: set[str] = set()
-    pool: list[tuple[str, int, float]] = []
-    if selected_analysis_name and selected_analysis_name.strip():
-        sn = selected_analysis_name.strip()
-        seen.add(sn.lower())
-        sim_pick = 0.0
-        for name, cnt, sim in closest_person_matches:
-            if name.strip().lower() == sn.lower():
-                sim_pick = float(sim)
-                break
-        pool.append((sn, 0, sim_pick))
-    for name, cnt, sim in closest_person_matches:
-        if name.strip().lower() in seen:
+    mq = (match_phrase or "").strip() or qd
+    exclude = _weak_match_exclude_name_keys(qd, mq, *excluded_phrases)
+
+    raw_matches = get_closest_person_matches(mq, summary.persons, limit=max(limit * 3, 12))
+    filtered: list[tuple[str, int, float]] = []
+    seen_norm: set[str] = set()
+    for name, cnt, sim in raw_matches:
+        nk = _normalize_person_name(name)
+        if nk in exclude:
             continue
-        seen.add(name.strip().lower())
-        pool.append((name, cnt, sim))
-    for name, _cnt, sim in pool[:limit]:
-        sim_pct = f"{100.0 * float(sim):.0f}%" if sim and float(sim) > 0 else "—"
-        rows.append(f"- **{name}** — contextual similarity **{sim_pct}** (not verified as the same person)")
-    matches_md = "\n".join(rows) if rows else "- _(No close person entities in this retrieval slice)_"
+        if nk in seen_norm:
+            continue
+        seen_norm.add(nk)
+        filtered.append((name, int(cnt), float(sim)))
+        if len(filtered) >= limit:
+            break
+
+    rows = [
+        f"- **{name}** — possible spelling match — not verified as the same person"
+        for name, _cnt, _sim in filtered
+    ]
+    matches_md = "\n".join(rows) if rows else "- _(No person entities extracted in this retrieval slice)_"
     return (
         f"No confirmed exact match was found for **{qd}**.\n\n"
-        "Possible similar entities were retrieved from contextual references, but identity confidence is "
-        "insufficient for operational assessment.\n\n"
         f"Possible matches:\n{matches_md}\n\n"
-        "Please refine the query using:\n"
-        "- **full name**\n"
-        "- **phone**\n"
-        "- **vehicle**\n"
-        "- **company**\n"
-        "- **alias**"
+        "Please refine the query using full name, phone, vehicle, company, or alias."
     )
 
 
@@ -4503,10 +4511,12 @@ def main() -> None:
             "Only the summary below and unverified snippets are shown; mission-board analytics are withheld."
         )
         q_show = (target_entity or search_query or query or "").strip()
+        match_q = (cluster_name_phrase or search_query or target_entity or q_show).strip()
         weak_brief = _format_weak_match_analyst_brief(
             q_show,
-            closest_person_matches,
-            selected_analysis_name,
+            match_q,
+            summary,
+            excluded_phrases=(target_entity, search_query, query, cluster_name_phrase),
         )
         st.markdown('<div class="intelink-card intelink-assessment-card">', unsafe_allow_html=True)
         st.markdown("###### AI summary")
